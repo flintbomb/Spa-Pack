@@ -32,10 +32,15 @@ const int resolution = 8;
 #define NUM_LEDS 1
 #define BRIGHTNESS 20
 
-const int HIGH_LIMIT = 110;
-bool ERROR_STATE = false;
+const int HIGH_LIMIT = 106;
+int ERROR_STATE = 0; 
+// 0 All systems active
+// 1 ERROR: No flow detected from circulation pump!
+// 2 ERROR: Flow before circulation pump turned on!
+// 3 ERROR: High limit temperature exceeded! Heater turned off!
+
 int TEMP_SETPOINT = 71; // Desired temperature in Fahrenheit
-const int TEMP_HYSTERESIS = 1; // Hysteresis in Fahrenheit
+const float TEMP_HYSTERESIS = 0.5; // Hysteresis in Fahrenheit
 const long CHECK_WIFI_INTERVAL = 30000; // Check every 30 seconds
 
 const char* WIFI_SSID = "DropItLikeItsAHotspot";
@@ -68,6 +73,7 @@ const char* jet1StateTopic = "spa/jet1_state";
 const char* jet2StateTopic = "spa/jet2_state";
 const char* lightStateTopic = "spa/light_state";
 const char* highLimitTopic = "spa/high_limit";
+const char* errorStateTopic = "spa/status";
 
 //Filtration cycle info
 int FILTER_DURATION = 30; // in minutes
@@ -86,7 +92,7 @@ long wifiConnectTimer = 0;
 void outputPrintln(const String &msg);
 void outputPrint(const String &msg);
 //void setupWebServer();
-bool checkCirculationPump();
+void checkCirculationPump();
 void checkTemperature();
 bool flowDetected();
 
@@ -104,7 +110,8 @@ void WiFiEvent(WiFiEvent_t event);
 void checkHighLimitSensor();
 void checkWaterTemperature();
 void publishCurrentTemperature();
-void publishSetpointTemperature();  
+void publishSetpointTemperature();
+void publishErrorState();  
 void publishHeaterState();
 void setJet1State();
 void setJet2State();

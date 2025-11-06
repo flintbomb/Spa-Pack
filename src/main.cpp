@@ -101,7 +101,7 @@ void setup() {
   waterSensor.begin();
 
   //Activate and check circulation pump, if bad flow sensor or no flow detected sets error state TRUE
-  ERROR_STATE = checkCirculationPump(); //Check if circulation pump is running
+  checkCirculationPump(); //Check if circulation pump is running
 
   //Setup MQTT Server and Callbacks
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
@@ -154,6 +154,7 @@ void setup() {
     })
     .onEnd([]() {
       outputPrintln("\nEnd");
+      ESP.restart();
     })
     .onProgress([](unsigned int progress, unsigned int total) {
       //outputPrintln("Progress: %u%%\r", (progress / (total / 100)));
@@ -179,7 +180,7 @@ void setup() {
   stabilizeSensors();
 
   //Turn on OZONE 
-  if (!ERROR_STATE) digitalWrite(OZONE_PIN, ON);
+  if (ERROR_STATE = 0) digitalWrite(OZONE_PIN, ON);
 
 }
 
@@ -192,6 +193,9 @@ void loop() {
   ArduinoOTA.handle();
 
   //HOT TUB LOGIC **************************************************************************
+  
+  // send Error state 
+  publishErrorState();
 
   // Check high limit sensor
   checkHighLimitSensor();
@@ -199,9 +203,9 @@ void loop() {
   // Check water temperature
   checkWaterTemperature();
 
-  if (!ERROR_STATE && !flowDetected && jet1State == 0) 
+  if (ERROR_STATE == 0 && !flowDetected && jet1State == 0) 
   {
-    ERROR_STATE = true;
+    ERROR_STATE = 1;
     digitalWrite(HEATER_PIN, OFF);
     heaterState = OFF;
     outputPrintln(F("ERROR: No flow detected from circulation pump!"));
@@ -209,7 +213,7 @@ void loop() {
   }
   
   // If error state is false, check temperature and control heater
-  if (!ERROR_STATE) {
+  if (ERROR_STATE == 0) {
     
     //only run heater if no jet pumps are on and flow is detected
     if (flowDetected && jet1State == OFF && jet2State == OFF) {
@@ -223,7 +227,8 @@ void loop() {
         outputPrintln(F("Heater turned off due to pump operation."));
       }
     }else if (!flowDetected) { 
-      ERROR_STATE = true;
+      ERROR_STATE = 1;
+      publishErrorState();
       if (heaterState != OFF) {
         heaterState = OFF;
         digitalWrite(HEATER_PIN, OFF); 
@@ -240,7 +245,7 @@ void loop() {
 
 void outputPrintln(const String &msg) {
   String msgOut = msg;
-  if (ERROR_STATE) {
+  if (ERROR_STATE > 0) {
     msgOut = "Error State: ";
     msgOut = msgOut + msg;
   }
@@ -250,7 +255,7 @@ void outputPrintln(const String &msg) {
 
 void outputPrint(const String &msg) {
   String msgOut = msg;
-  if (ERROR_STATE) {
+  if (ERROR_STATE > 0) {
     msgOut = "Error State: ";
     msgOut = msgOut + msg;
   }
@@ -341,6 +346,7 @@ void onMqttConnect(bool sessionPresent) {
   publishSetpointTemperature();
   publishCurrentTemperature();
   publishHeaterState();
+  publishErrorState();
   mqttClient.publish(lightStateTopic, 1, true, "OFF");
   mqttClient.publish(jet1StateTopic, 1, true, "OFF");
   mqttClient.publish(jet2StateTopic, 1, true, "OFF");
@@ -479,7 +485,7 @@ void stabilizeSensors() {
   } 
 }
 
-bool checkCirculationPump() {
+void checkCirculationPump() {
   // CHeck if circulation pump and flow sensor are working
   if (!flowDetected()) {
     digitalWrite(CIRCULATION_PUMP_PIN, ON);
@@ -487,14 +493,14 @@ bool checkCirculationPump() {
     if (!flowDetected()) {
       //digitalWrite(CIRCULATION_PUMP_PIN, OFF);
       outputPrintln(F("ERROR: No flow detected from circulation pump!"));
-      return true; // ERROR_STATE = true
+      ERROR_STATE = 1; // ERROR_STATE = true
     } else {
       outputPrintln(F("Circulation pump and flow sensor are working."));
-      return false; // ERROR_STATE = false
+      ERROR_STATE = 0; // ERROR_STATE = false
     }
   } else {
     outputPrintln(F("ERROR: Bad Flow Sensor - Flow detected before ciculation pump activated!"));
-    return true; // ERROR_STATE = true
+    ERROR_STATE = 2; // ERROR_STATE = true
   }
 } 
 
@@ -527,7 +533,7 @@ void checkTemperature() {
 }
 
 void checkHighLimitSensor() {
-  if (ERROR_STATE) return; // If already in error state, skip checking
+  if (ERROR_STATE > 0) return; // If already in error state, skip checking
   if (millis() % 10000 != 0) return; // Check every 10 seconds
 
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
@@ -535,7 +541,7 @@ void checkHighLimitSensor() {
   if (highLimitTemp >= HIGH_LIMIT) {
     digitalWrite(HEATER_PIN, OFF);
     heaterState = OFF;
-    ERROR_STATE = true;
+    ERROR_STATE = 3;
     outputPrintln(F("ERROR: High limit temperature exceeded! Heater turned off."));
     publishHeaterState();
   }
@@ -591,15 +597,24 @@ void publishHeaterState() {
   mqttClient.publish(heaterStateTopic, 1, true, output);
 }
 
+void publishErrorState() {
+   if (millis() % 30000 != 0) return;
+  char output[4];
+  sprintf(output,"%d",ERROR_STATE);
+  outputPrint(F("Publishing error state to MQTT..."));
+  outputPrint(output);
+  mqttClient.publish(errorStateTopic, 1, true, output);
+}
+
 void setJet1State() {
   if (jet1State == 1) {
     digitalWrite(PUMP1_HIGH_PIN, OFF);
-    delay(500);
+    delay(250);
     digitalWrite(PUMP1_LOW_PIN, ON);
     outputPrintln(F("Pump 1 set to LOW"));
   } else if (jet1State == 2) {
     digitalWrite(PUMP1_LOW_PIN, OFF);
-    delay(500);
+    delay(250);
     digitalWrite(PUMP1_HIGH_PIN, ON);
     outputPrintln(F("Pump 1 set to HIGH"));
   } else {
@@ -660,7 +675,7 @@ void setSpaLight(int brightness) {
   if (lightState == 1) doc["state"] = "LOW";
    else if (lightState == 2) doc["state"] = "MEDIUM";
    else if (lightState == 3) doc["state"] = "HIGH";
-   else if (lightState == OFF) doc["state"] = "OFF";
+   else if (lightState == OFF) doc["state"] = "OFF1";
   char output[256];
   serializeJson(doc, output);
   outputPrint(F("Publishing light state to MQTT..."));

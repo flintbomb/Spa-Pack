@@ -32,7 +32,7 @@ const int resolution = 8;
 #define NUM_LEDS 1
 #define BRIGHTNESS 20
 
-const int HIGH_LIMIT = 106;
+const int HIGH_LIMIT = 119;
 int ERROR_STATE = 0; 
 // 0 All systems active
 // 1 ERROR: No flow detected from circulation pump!
@@ -79,6 +79,7 @@ const char* errorStateTopic = "spa/status";
 int FILTER_DURATION = 30; // in minutes
 int FILTER_START_HOUR = 8; // 8 AM
 int FILTER_START_MINUTE = 0;
+unsigned long jetMaxRunTime = 30*60*1000;    // max time jets run for 
 
 //global control variable declarations
 int jet1State = 0;
@@ -87,7 +88,11 @@ int lightState = 0;
 int heaterState = 0;
 float currentTemp = 0.0;
 float highLimitTemp = 0.0;
-long wifiConnectTimer = 0;
+unsigned long wifiConnectTimer = 0;
+unsigned long jet1Timer = 0;
+unsigned long jet2Timer = 0;
+bool filterCycleRunning = false;
+
 
 void outputPrintln(const String &msg);
 void outputPrint(const String &msg);
@@ -117,3 +122,5 @@ void setJet1State();
 void setJet2State();
 void stabilizeSensors();
 void setSpaLight(int brightness);
+void checkJetTimers();
+void checkFilterCycle();

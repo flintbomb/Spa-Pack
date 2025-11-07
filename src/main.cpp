@@ -4,7 +4,6 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncMqttClient.h> 
-//#include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
@@ -13,6 +12,8 @@
 #include <arduinoJson.h>
 #include <WebSerial.h>
 #include <FastLED.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
 
 extern "C" {
 	#include "freertos/FreeRTOS.h"
@@ -35,6 +36,10 @@ TimerHandle_t wifiReconnectTimer;
 //wifi connection variables
 unsigned long previousMillis = 0;
 AsyncWebServer server(80);
+
+// NTP Client setup for time keeping
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3600 * 7); // Adjust for your timezone (e.g., -7 hours for PST)
 
 // Setup oneWire instances to communicate with temperature sensors
 OneWire oneWire1(ONE_WIRE_BUS_WATER_PIN);
@@ -135,6 +140,34 @@ void setup() {
     if (d.startsWith("r")) {
       outputPrintln("Restarting...");
       ESP.restart();
+    } else if (d.startsWith("h")) {
+      String numberString = "";
+      for (int i = 0; i < d.length(); i++) {
+        if (isDigit(d.charAt(i))) {
+          numberString += d.charAt(i);
+        }
+      }
+      FILTER_START_HOUR = numberString.toInt(); // Use toInt() for numbers
+      //Store hour in NVM
+      preferences.begin("states", false);
+      preferences.putInt("filterHour", FILTER_START_HOUR); 
+      preferences.end(); 
+      outputPrint(F("Set filter start hour to :"));
+      outputPrintln(numberString);
+    } else if (d.startsWith("m")) {
+      String numberString = "";
+      for (int i = 0; i < d.length(); i++) {
+        if (isDigit(d.charAt(i))) {
+          numberString += d.charAt(i);
+        }
+      }
+      FILTER_START_MINUTE = numberString.toInt(); // Use toInt() for numbers
+      //Store minute in NVM
+      preferences.begin("states", false);
+      preferences.putInt("filterMinute", FILTER_START_MINUTE); 
+      preferences.end(); 
+      outputPrint(F("Set filter start minute to :"));
+      outputPrintln(numberString);
     }
   });
   server.begin();
@@ -176,6 +209,9 @@ void setup() {
 
   ArduinoOTA.begin();
 
+  // Initialize NTP client
+  timeClient.begin();
+
   //Stabilize temperature sensors
   stabilizeSensors();
 
@@ -202,6 +238,12 @@ void loop() {
 
   // Check water temperature
   checkWaterTemperature();
+
+  // update NTP time and cHeck if filter cycle due to begin
+  checkFilterCycle();
+
+  //check if jets have been on for 30min and turn off
+  checkJetTimers();
 
   if (ERROR_STATE == 0 && !flowDetected && jet1State == 0) 
   {
@@ -295,13 +337,14 @@ void WiFiEvent(WiFiEvent_t event) {
     outputPrintln(output);
     IPAddress ip = WiFi.localIP();
     switch(event) {
-    case SYSTEM_EVENT_STA_GOT_IP:
+    case SYSTEM_EVENT_STA_GOT_IP:     // means we have connected to wifi
         // Blue led while connected to WiFi
         leds[0] = CRGB::Blue;
         FastLED.show();
         outputPrintln("WiFi connected");
         outputPrintln("IP address: ");
         outputPrintln(ip.toString());
+        timeClient.update();   //update time
         connectToMqtt();
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
@@ -556,6 +599,31 @@ void checkWaterTemperature() {
   publishCurrentTemperature();
 }
 
+void checkJetTimers() {
+  unsigned long currentTime = millis();
+  if (jet1Timer < currentTime && jet1State > 0) {
+    jet1State = 0;
+    setJet1State();
+  }
+  if (jet2Timer < currentTime && jet2State > 0) {
+    jet2State = 0;
+    setJet2State();
+  }
+}
+
+void checkFilterCycle() {
+  if (millis() % 60000 == 0) timeClient.update(); // Update time from NTP every 60 seconds
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+
+  // Check for alarm condition
+  if (!filterCycleRunning && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE && timeClient.getSeconds() == 0) {
+    filterCycleRunning = true; // Disable alarm until reset or next day if desired
+    jet1State = 1;
+    setJet1State();
+  }
+}
+
 void publishSetpointTemperature() {
   JsonDocument doc;
   doc["temperature"] = String(TEMP_SETPOINT).c_str();
@@ -602,25 +670,29 @@ void publishErrorState() {
   char output[4];
   sprintf(output,"%d",ERROR_STATE);
   outputPrint(F("Publishing error state to MQTT..."));
-  outputPrint(output);
+  outputPrintln(output);
   mqttClient.publish(errorStateTopic, 1, true, output);
 }
 
 void setJet1State() {
   if (jet1State == 1) {
+    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP1_HIGH_PIN, OFF);
     delay(250);
     digitalWrite(PUMP1_LOW_PIN, ON);
     outputPrintln(F("Pump 1 set to LOW"));
   } else if (jet1State == 2) {
+    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP1_LOW_PIN, OFF);
     delay(250);
     digitalWrite(PUMP1_HIGH_PIN, ON);
     outputPrintln(F("Pump 1 set to HIGH"));
   } else {
+    jet1Timer = millis();
     digitalWrite(PUMP1_HIGH_PIN, OFF);
     digitalWrite(PUMP1_LOW_PIN, OFF);
     outputPrintln(F("Pump 1 turned OFF"));
+    filterCycleRunning = false;      // reset filter cycle variable so filter cycle can trigger again
   }
   
   //publish to mqtt
@@ -637,16 +709,19 @@ void setJet1State() {
 
 void setJet2State() {
   if (jet2State == 1) {
+    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_LOW_PIN, ON);
     outputPrintln(F("Pump 2 set to LOW"));
   } else if (jet2State == 2) {
+    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_LOW_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_HIGH_PIN, ON);
     outputPrintln(F("Pump 2 set to HIGH"));
   } else {
+    jet1Timer = millis();
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     digitalWrite(PUMP2_LOW_PIN, OFF);
     outputPrintln(F("Pump 2 turned OFF"));
@@ -680,5 +755,5 @@ void setSpaLight(int brightness) {
   serializeJson(doc, output);
   outputPrint(F("Publishing light state to MQTT..."));
   outputPrint(output);
-  mqttClient.publish(heaterStateTopic, 1, true, output);
+  mqttClient.publish(lightStateTopic, 1, true, output);
 }

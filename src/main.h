@@ -80,6 +80,7 @@ int FILTER_DURATION = 30; // in minutes
 int FILTER_START_HOUR = 8; // 8 AM
 int FILTER_START_MINUTE = 0;
 unsigned long jetMaxRunTime = 30*60*1000;    // max time jets run for 
+unsigned long lightMaxRunTime = 60*60*1000;  // max time light runs for
 
 //global control variable declarations
 int jet1State = 0;
@@ -91,6 +92,7 @@ float highLimitTemp = 0.0;
 unsigned long wifiConnectTimer = 0;
 unsigned long jet1Timer = 0;
 unsigned long jet2Timer = 0;
+unsigned long lightTimer = 0;
 bool filterCycleRunning = false;
 
 
@@ -124,3 +126,4 @@ void stabilizeSensors();
 void setSpaLight(int brightness);
 void checkJetTimers();
 void checkFilterCycle();
+void getNTPTime();

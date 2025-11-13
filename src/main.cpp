@@ -32,6 +32,7 @@ Preferences preferences;
 AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
 TimerHandle_t wifiReconnectTimer;
+TimerHandle_t getTimeTimer;
 
 //wifi connection variables
 unsigned long previousMillis = 0;
@@ -39,7 +40,7 @@ AsyncWebServer server(80);
 
 // NTP Client setup for time keeping
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", -3600 * 7); // Adjust for your timezone (e.g., -7 hours for PST)
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -3600 * 8); // Adjust for your timezone (e.g., -7 hours for PST)
 
 // Setup oneWire instances to communicate with temperature sensors
 OneWire oneWire1(ONE_WIRE_BUS_WATER_PIN);
@@ -108,10 +109,12 @@ void setup() {
   //Activate and check circulation pump, if bad flow sensor or no flow detected sets error state TRUE
   checkCirculationPump(); //Check if circulation pump is running
 
-  //Setup MQTT Server and Callbacks
+  //create timers for tasks
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWiFi));
+  getTimeTimer = xTimerCreate("timeTimer", pdMS_TO_TICKS(60000), pdTRUE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(getNTPTime));
 
+  //Setup MQTT Server and Callbacks
   mqttClient.onConnect(onMqttConnect);
   mqttClient.onDisconnect(onMqttDisconnect);
   mqttClient.onSubscribe(onMqttSubscribe);
@@ -153,7 +156,7 @@ void setup() {
       preferences.putInt("filterHour", FILTER_START_HOUR); 
       preferences.end(); 
       outputPrint(F("Set filter start hour to :"));
-      outputPrintln(numberString);
+      outputPrintln(String(FILTER_START_HOUR));
     } else if (d.startsWith("m")) {
       String numberString = "";
       for (int i = 0; i < d.length(); i++) {
@@ -167,7 +170,7 @@ void setup() {
       preferences.putInt("filterMinute", FILTER_START_MINUTE); 
       preferences.end(); 
       outputPrint(F("Set filter start minute to :"));
-      outputPrintln(numberString);
+      outputPrintln(String(FILTER_START_MINUTE));
     }
   });
   server.begin();
@@ -239,24 +242,15 @@ void loop() {
   // Check water temperature
   checkWaterTemperature();
 
-  // update NTP time and cHeck if filter cycle due to begin
-  checkFilterCycle();
-
   //check if jets have been on for 30min and turn off
   checkJetTimers();
 
-  if (ERROR_STATE == 0 && !flowDetected && jet1State == 0) 
-  {
-    ERROR_STATE = 1;
-    digitalWrite(HEATER_PIN, OFF);
-    heaterState = OFF;
-    outputPrintln(F("ERROR: No flow detected from circulation pump!"));
-    
-  }
-  
   // If error state is false, check temperature and control heater
   if (ERROR_STATE == 0) {
     
+    // update NTP time and cHeck if filter cycle is due to begin
+    checkFilterCycle();
+
     //only run heater if no jet pumps are on and flow is detected
     if (flowDetected && jet1State == OFF && jet2State == OFF) {
       // check temperature and turn heater on or off as needed
@@ -268,7 +262,7 @@ void loop() {
         publishHeaterState();
         outputPrintln(F("Heater turned off due to pump operation."));
       }
-    }else if (!flowDetected) { 
+    }else if (!flowDetected) {  
       ERROR_STATE = 1;
       publishErrorState();
       if (heaterState != OFF) {
@@ -277,6 +271,13 @@ void loop() {
         digitalWrite(CIRCULATION_PUMP_PIN, OFF); 
         outputPrintln(F("No flow detected, heater turned off.")); //display every 10 seconds
         publishHeaterState();
+      }
+      if (jet1State > 0 || jet2State > 0) {
+        jet1State = 0;
+        jet2State = 0;
+        setJet1State();
+        setJet2State();
+        outputPrintln(F("ERROR: Jets Turned Off!"));
       }
     }
 
@@ -344,7 +345,8 @@ void WiFiEvent(WiFiEvent_t event) {
         outputPrintln("WiFi connected");
         outputPrintln("IP address: ");
         outputPrintln(ip.toString());
-        timeClient.update();   //update time
+        getNTPTime();   //update time
+        xTimerStart(getTimeTimer, 0);
         connectToMqtt();
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
@@ -602,22 +604,44 @@ void checkWaterTemperature() {
 void checkJetTimers() {
   unsigned long currentTime = millis();
   if (jet1Timer < currentTime && jet1State > 0) {
+    outputPrintln(F("Jet 1 timer expired, turning off Jet 1."));
     jet1State = 0;
     setJet1State();
   }
   if (jet2Timer < currentTime && jet2State > 0) {
+    outputPrintln(F("Jet 2 timer expired, turning off Jet 2."));
     jet2State = 0;
     setJet2State();
   }
+  if (lightTimer < currentTime && lightState > 0) {
+    outputPrintln(F("Light timer expired, turning off lights."));
+    lightState = 0;
+    setSpaLight(OFF);
+  }
 }
 
+void getNTPTime() {
+  timeClient.update(); // Update time from NTP every 60 seconds
+  
+  int currentHour = timeClient.getHours();
+  int currentMinute = timeClient.getMinutes();
+
+    outputPrint(F("Time updated to    -"));
+    outputPrint(String(currentHour));
+    outputPrint(F(":"));
+    outputPrintln(String(currentMinute));
+    outputPrint(F("Filter Cycle Start -"));
+    outputPrint(String(FILTER_START_HOUR));
+    outputPrint(F(":"));
+    outputPrintln(String(FILTER_START_MINUTE));
+}
 void checkFilterCycle() {
-  if (millis() % 60000 == 0) timeClient.update(); // Update time from NTP every 60 seconds
+ 
   int currentHour = timeClient.getHours();
   int currentMinute = timeClient.getMinutes();
 
   // Check for alarm condition
-  if (!filterCycleRunning && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE && timeClient.getSeconds() == 0) {
+  if (!filterCycleRunning && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE) {
     filterCycleRunning = true; // Disable alarm until reset or next day if desired
     jet1State = 1;
     setJet1State();
@@ -687,7 +711,7 @@ void setJet1State() {
     delay(250);
     digitalWrite(PUMP1_HIGH_PIN, ON);
     outputPrintln(F("Pump 1 set to HIGH"));
-  } else {
+  } else if (jet1State == 0) {
     jet1Timer = millis();
     digitalWrite(PUMP1_HIGH_PIN, OFF);
     digitalWrite(PUMP1_LOW_PIN, OFF);
@@ -709,19 +733,19 @@ void setJet1State() {
 
 void setJet2State() {
   if (jet2State == 1) {
-    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
+    jet2Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_LOW_PIN, ON);
     outputPrintln(F("Pump 2 set to LOW"));
   } else if (jet2State == 2) {
-    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
+    jet2Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_LOW_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_HIGH_PIN, ON);
     outputPrintln(F("Pump 2 set to HIGH"));
-  } else {
-    jet1Timer = millis();
+  } else if (jet2State == 0) {
+    jet2Timer = millis();
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     digitalWrite(PUMP2_LOW_PIN, OFF);
     outputPrintln(F("Pump 2 turned OFF"));
@@ -747,10 +771,20 @@ void setSpaLight(int brightness) {
    
   //publish to mqtt
   JsonDocument doc;
-  if (lightState == 1) doc["state"] = "LOW";
-   else if (lightState == 2) doc["state"] = "MEDIUM";
-   else if (lightState == 3) doc["state"] = "HIGH";
-   else if (lightState == OFF) doc["state"] = "OFF1";
+  if (lightState == 1) {
+    doc["state"] = "LOW";
+    lightTimer = millis() + lightMaxRunTime;   //set light low timer ahead by max run time
+  } else if (lightState == 2) {
+    doc["state"] = "MEDIUM"; 
+    lightTimer = millis() + lightMaxRunTime;   //set light MEDIUM timer ahead by max run time
+  } else if (lightState == 3) {
+    doc["state"] = "HIGH";
+    lightTimer = millis() + lightMaxRunTime;   //set light HIGH timer ahead by max run time
+  } else if (lightState == OFF) {
+    doc["state"] = "OFF1";
+    lightTimer = millis();
+  }
+
   char output[256];
   serializeJson(doc, output);
   outputPrint(F("Publishing light state to MQTT..."));

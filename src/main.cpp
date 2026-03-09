@@ -25,6 +25,12 @@ extern "C" {
 //send temperature and heater state to mqtt periodically
 //format mqtt messages as json
 
+// ERROR INFO STRING
+String ERROR_INFO = "";
+
+//initialize temperature smoothing array;
+float previousHighLimitTemp[6] = {0};
+
 //NVM Preferances 
 Preferences preferences;
 
@@ -578,15 +584,34 @@ void checkTemperature() {
 }
 
 void checkHighLimitSensor() {
+  boolean triggerHighLimit = false;
+  
   if (ERROR_STATE > 0) return; // If already in error state, skip checking
   if (millis() % 10000 != 0) return; // Check every 10 seconds
 
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
   highLimitTemp = highLimitSensor.getTempFByIndex(0);
-  if (highLimitTemp >= HIGH_LIMIT) {
+
+  // Shift previous temperatures
+  for (int i = 4; i >= 0; i--) {
+    previousHighLimitTemp[i + 1] = previousHighLimitTemp[i];
+  }
+  previousHighLimitTemp[0] = highLimitTemp; // Add current temp to the front of the array
+  // Check if current temp exceeds high limit and  is within 10 degrees of the previous 5 readings to avoid false positives from sensor errors
+  for (int i = 1; i <= 5; i++) {
+    if (highLimitTemp >= HIGH_LIMIT && abs(highLimitTemp - previousHighLimitTemp[i]) < 10) {
+      triggerHighLimit = true;
+    } else {
+      triggerHighLimit = false;
+      break; // If any previous reading is not within range, exit the loop
+    }
+  }
+
+  if (triggerHighLimit) {
     digitalWrite(HEATER_PIN, OFF);
     heaterState = OFF;
     ERROR_STATE = 3;
+    ERROR_INFO = highLimitTemp;
     outputPrintln(F("ERROR: High limit temperature exceeded! Heater turned off."));
     publishHeaterState();
   }
@@ -695,6 +720,8 @@ void publishErrorState() {
   sprintf(output,"%d",ERROR_STATE);
   outputPrint(F("Publishing error state to MQTT..."));
   outputPrintln(output);
+  outputPrintln(F("Error info: "));
+  outputPrintln(ERROR_INFO);
   mqttClient.publish(errorStateTopic, 1, true, output);
 }
 

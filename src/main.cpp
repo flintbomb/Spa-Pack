@@ -225,7 +225,7 @@ void setup() {
   stabilizeSensors();
 
   //Turn on OZONE 
-  if (ERROR_STATE = 0) digitalWrite(OZONE_PIN, ON);
+  if (ERROR_STATE == 0) digitalWrite(OZONE_PIN, ON);
 
 }
 
@@ -258,7 +258,7 @@ void loop() {
     checkFilterCycle();
 
     //only run heater if no jet pumps are on and flow is detected
-    if (flowDetected && jet1State == OFF && jet2State == OFF) {
+    if (flowDetected() && jet1State == OFF && jet2State == OFF) {
       // check temperature and turn heater on or off as needed
       checkTemperature();
     } else if (jet1State == ON || jet2State == ON) {
@@ -268,7 +268,7 @@ void loop() {
         publishHeaterState();
         outputPrintln(F("Heater turned off due to pump operation."));
       }
-    }else if (!flowDetected) {  
+    } else if (!flowDetected()) {
       ERROR_STATE = 1;
       publishErrorState();
       if (heaterState != OFF) {
@@ -550,7 +550,7 @@ void checkCirculationPump() {
       ERROR_STATE = 0; // ERROR_STATE = false
     }
   } else {
-    outputPrintln(F("ERROR: Bad Flow Sensor - Flow detected before ciculation pump activated!"));
+    outputPrintln(F("ERROR: Bad Flow Sensor - Flow detected before circulation pump activated!"));
     ERROR_STATE = 2; // ERROR_STATE = true
   }
 } 
@@ -564,7 +564,10 @@ bool flowDetected() {
 }
 
 void checkTemperature() {
-  if (millis() % 3000 != 0) return; // Check every 3 seconds
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 3000) return;
+  lastCheck = now;
   //Serial.print(TEMP_SETPOINT - TEMP_HYSTERESIS);
   //Serial.print(" < ");
   //Serial.print(currentTemp);
@@ -586,8 +589,11 @@ void checkTemperature() {
 void checkHighLimitSensor() {
   boolean triggerHighLimit = false;
   
-  if (ERROR_STATE > 0) return; // If already in error state, skip checking
-  if (millis() % 10000 != 0) return; // Check every 10 seconds
+  if (ERROR_STATE > 0) return;
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 10000) return;
+  lastCheck = now;
 
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
   highLimitTemp = highLimitSensor.getTempFByIndex(0);
@@ -611,14 +617,17 @@ void checkHighLimitSensor() {
     digitalWrite(HEATER_PIN, OFF);
     heaterState = OFF;
     ERROR_STATE = 3;
-    ERROR_INFO = highLimitTemp;
+    ERROR_INFO = String(highLimitTemp, 1);
     outputPrintln(F("ERROR: High limit temperature exceeded! Heater turned off."));
     publishHeaterState();
   }
 }
 
 void checkWaterTemperature() {
-  if (millis() % 15000 != 0) return; // Check every 15 seconds
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 15000) return;
+  lastCheck = now;
   waterSensor.requestTemperatures(); // Send the command to get temperatures
   currentTemp = waterSensor.getTempFByIndex(0);
   //outputPrint(F("Current water temperature: "));
@@ -661,14 +670,20 @@ void getNTPTime() {
     outputPrintln(String(FILTER_START_MINUTE));
 }
 void checkFilterCycle() {
- 
+  static unsigned long filterStartTime = 0;
   int currentHour = timeClient.getHours();
   int currentMinute = timeClient.getMinutes();
 
-  // Check for alarm condition
   if (!filterCycleRunning && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE) {
-    filterCycleRunning = true; // Disable alarm until reset or next day if desired
+    filterCycleRunning = true;
+    filterStartTime = millis();
     jet1State = 1;
+    setJet1State();
+  }
+
+  if (filterCycleRunning && (millis() - filterStartTime >= (unsigned long)FILTER_DURATION * 60000)) {
+    filterCycleRunning = false;
+    jet1State = 0;
     setJet1State();
   }
 }
@@ -715,9 +730,12 @@ void publishHeaterState() {
 }
 
 void publishErrorState() {
-   if (millis() % 30000 != 0) return;
-  char output[4];
-  sprintf(output,"%d",ERROR_STATE);
+  static unsigned long lastCheck = 0;
+  unsigned long now = millis();
+  if (now - lastCheck < 30000) return;
+  lastCheck = now;
+  char output[12];
+  snprintf(output, sizeof(output), "%d", ERROR_STATE);
   outputPrint(F("Publishing error state to MQTT..."));
   outputPrintln(output);
   outputPrintln(F("Error info: "));
@@ -808,7 +826,7 @@ void setSpaLight(int brightness) {
     doc["state"] = "HIGH";
     lightTimer = millis() + lightMaxRunTime;   //set light HIGH timer ahead by max run time
   } else if (lightState == OFF) {
-    doc["state"] = "OFF1";
+    doc["state"] = "OFF";
     lightTimer = millis();
   }
 

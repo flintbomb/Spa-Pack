@@ -248,6 +248,9 @@ void loop() {
   //check if jets have been on for 30min and turn off
   checkJetTimers();
 
+  // step the Fix-A-Leak program between HIGH and LOW
+  checkFixALeak();
+
   // If error state is false, check temperature and control heater
   if (ERROR_STATE == 0) {
     
@@ -384,7 +387,7 @@ void onMqttConnect(bool sessionPresent) {
   outputPrint("Subscribing at QoS 1, packetId: ");
   outputPrintln(String(packetIdSub));
 
-  packetIdSub = mqttClient.subscribe(jetsLongRunButtonTopic, 1);
+  packetIdSub = mqttClient.subscribe(fixALeakSetTopic, 1);
   outputPrint("Subscribing at QoS 1, packetId: ");
   outputPrintln(String(packetIdSub));
 
@@ -402,7 +405,7 @@ void onMqttConnect(bool sessionPresent) {
 
   // Announce the 12 hour run control to Home Assistant
   publishDiscovery();
-  publishLongRunState();
+  publishFixALeakState();
 
   // Publish initial setpoint temperature
   publishSetpointTemperature();
@@ -458,6 +461,7 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
     // Serial.print(".");
   //Logic to handle received messages
   if (String(topic) == jet1buttonTopic) {
+    cancelFixALeak();   // manual control takes over
     if (strncmp(payload, "OFF",3)  == 0) {
       jet1State = 0;
       setJet1State();
@@ -469,6 +473,7 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
       setJet1State();
     }
   } else if (String(topic) == jet2buttonTopic) {
+    cancelFixALeak();   // manual control takes over
     if (strncmp(payload, "OFF",3) == 0) {
       jet2State = 0;
       setJet2State();
@@ -479,19 +484,13 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
       jet2State = 2;
       setJet2State();
     }
-  } else if (String(topic) == jetsLongRunButtonTopic) {
-    // Run both pumps together for jetLongRunTime (12 hours)
-    int newState = -1;
-    if (strncmp(payload, "OFF",3) == 0) newState = 0;
-    else if (strncmp(payload, "LOW",3) == 0) newState = 1;
-    else if (strncmp(payload, "HIGH",4) == 0) newState = 2;
-    if (newState >= 0) {
-      outputPrintln(F("Both pumps long run command received."));
-      filterCycleRunning = false;   // don't let an active filter cycle stop pump 1 early
-      jet1State = newState;
-      jet2State = newState;
-      setJet1State(jetLongRunTime);
-      setJet2State(jetLongRunTime);
+  } else if (String(topic) == fixALeakSetTopic) {
+    if (strncmp(payload, "ON",2) == 0) {
+      startFixALeak();
+    } else if (strncmp(payload, "OFF",3) == 0) {
+      // only touch the pumps if the program is running; manual jets are left alone
+      if (fixALeakActive) stopFixALeak();
+      else publishFixALeakState();
     }
   } else if (String(topic) == upButtonTopic) {
     // Increase temperature setpoint
@@ -847,7 +846,7 @@ void setJet1State(unsigned long runTime) {
   outputPrint(F("Publishing pump 1 state to MQTT..."));
   outputPrint(output);
   mqttClient.publish(jet1StateTopic, 1, true, output);
-  publishLongRunState();
+  publishFixALeakState();
 }
 
 void setJet2State(unsigned long runTime) {
@@ -879,19 +878,61 @@ void setJet2State(unsigned long runTime) {
   outputPrint(F("Publishing pump 2 state to MQTT..."));
   outputPrint(output);
   mqttClient.publish(jet2StateTopic, 1, true, output);
-  publishLongRunState();
+  publishFixALeakState();
 }
 
-// 12 hour run is active when both pumps are on at the same speed with the long run time
-bool longRunActive() {
-  return jet1State > 0 && jet1State == jet2State &&
-         jet1RunTime == jetLongRunTime && jet2RunTime == jetLongRunTime;
+// Fix-A-Leak: both pumps cycle FIX_A_LEAK_HIGH_TIME on HIGH then FIX_A_LEAK_LOW_TIME
+// on LOW, repeating until FIX_A_LEAK_DURATION, then both pumps turn off
+void startFixALeak() {
+  outputPrintln(F("Fix-A-Leak started."));
+  filterCycleRunning = false;   // don't let an active filter cycle stop pump 1 early
+  fixALeakActive = true;
+  fixALeakStartTime = millis();
+  jet1State = 0;                // force checkFixALeak() to apply the first step
+  jet2State = 0;
+  checkFixALeak();
 }
 
-// Ozone runs only with no errors and no 12 hour run
+void stopFixALeak() {
+  outputPrintln(F("Fix-A-Leak stopped."));
+  fixALeakActive = false;
+  jet1State = 0;
+  jet2State = 0;
+  setJet1State();
+  setJet2State();
+}
+
+// a manual jet command ends the program but leaves the pumps to the manual command
+void cancelFixALeak() {
+  if (!fixALeakActive) return;
+  outputPrintln(F("Fix-A-Leak cancelled by manual jet control."));
+  fixALeakActive = false;
+  publishFixALeakState();
+}
+
+void checkFixALeak() {
+  if (!fixALeakActive) return;
+  unsigned long elapsed = millis() - fixALeakStartTime;
+  if (elapsed >= FIX_A_LEAK_DURATION) {
+    outputPrintln(F("Fix-A-Leak complete."));
+    stopFixALeak();
+    return;
+  }
+  int wanted = (elapsed % (FIX_A_LEAK_HIGH_TIME + FIX_A_LEAK_LOW_TIME)) < FIX_A_LEAK_HIGH_TIME ? 2 : 1;
+  if (jet1State != wanted || jet2State != wanted) {
+    // jet timers run to the end of the program as a backstop
+    unsigned long remaining = FIX_A_LEAK_DURATION - elapsed;
+    jet1State = wanted;
+    jet2State = wanted;
+    setJet1State(remaining);
+    setJet2State(remaining);
+  }
+}
+
+// Ozone runs only with no errors and no Fix-A-Leak
 void updateOzone() {
   static int ozoneState = -1;
-  int wanted = (ERROR_STATE == 0 && !longRunActive()) ? ON : OFF;
+  int wanted = (ERROR_STATE == 0 && !fixALeakActive) ? ON : OFF;
   if (wanted != ozoneState) {
     ozoneState = wanted;
     digitalWrite(OZONE_PIN, wanted);
@@ -899,33 +940,29 @@ void updateOzone() {
   }
 }
 
-void publishLongRunState() {
-  const char* state = "OFF";
-  if (longRunActive()) {
-    state = (jet1State == 2) ? "HIGH" : "LOW";
-  }
-  mqttClient.publish(jetsLongRunStateTopic, 1, true, state);
+void publishFixALeakState() {
+  mqttClient.publish(fixALeakStateTopic, 1, true, fixALeakActive ? "ON" : "OFF");
 }
 
-// Home Assistant MQTT discovery for the 12 hour run select
+// Home Assistant MQTT discovery for the Fix-A-Leak switch
 void publishDiscovery() {
+  // remove the retired 12 hour select from Home Assistant
+  mqttClient.publish(oldJets12hDiscoveryTopic, 1, true, "");
+  mqttClient.publish(oldJets12hStateTopic, 1, true, "");
+
   JsonDocument doc;
-  doc["name"] = "Jets 12 Hour Run";
-  doc["unique_id"] = "spa_pack_jets_12h";
-  doc["icon"] = "mdi:pump";
-  doc["command_topic"] = jetsLongRunButtonTopic;
-  doc["state_topic"] = jetsLongRunStateTopic;
-  JsonArray options = doc["options"].to<JsonArray>();
-  options.add("OFF");
-  options.add("LOW");
-  options.add("HIGH");
+  doc["name"] = "Fix-A-Leak";
+  doc["unique_id"] = "spa_pack_fix_a_leak";
+  doc["icon"] = "mdi:water-pump";
+  doc["command_topic"] = fixALeakSetTopic;
+  doc["state_topic"] = fixALeakStateTopic;
   JsonObject device = doc["device"].to<JsonObject>();
   device["identifiers"][0] = "spa_pack";
   device["name"] = "Spa Pack";
   String output;
   serializeJson(doc, output);
   outputPrintln(F("Publishing Home Assistant discovery..."));
-  mqttClient.publish(jetsLongRunDiscoveryTopic, 1, true, output.c_str());
+  mqttClient.publish(fixALeakDiscoveryTopic, 1, true, output.c_str());
 }
 
 // Set spa light brightness (0-255)

@@ -75,9 +75,12 @@ const char* upButtonTopic = "spa/up_button";
 const char* downButtonTopic = "spa/down_button";
 const char* jet1buttonTopic = "spa/jet1_button"; 
 const char* jet2buttonTopic = "spa/jet2_button";
-const char* jetsLongRunButtonTopic = "spa/jets_12h_button";  // payload LOW/HIGH/OFF runs both pumps for jetLongRunTime
-const char* jetsLongRunStateTopic = "spa/jets_12h_state";
-const char* jetsLongRunDiscoveryTopic = "homeassistant/select/spa_pack/jets_12h/config";  // Home Assistant MQTT discovery
+const char* fixALeakSetTopic = "spa/fix_a_leak/set";      // payload ON/OFF starts/stops the Fix-A-Leak program
+const char* fixALeakStateTopic = "spa/fix_a_leak/state";
+const char* fixALeakDiscoveryTopic = "homeassistant/switch/spa_pack/fix_a_leak/config";  // Home Assistant MQTT discovery
+// retired 12 hour select; cleared on connect so Home Assistant removes it
+const char* oldJets12hDiscoveryTopic = "homeassistant/select/spa_pack/jets_12h/config";
+const char* oldJets12hStateTopic = "spa/jets_12h_state";
 const char* lightButtonTopic = "spa/light_button";  
 const char* heaterStateTopic = "spa/heater_state";
 const char* jet1StateTopic = "spa/jet1_state";
@@ -91,7 +94,10 @@ int FILTER_DURATION = 30; // in minutes
 int FILTER_START_HOUR = 8; // 8 AM
 int FILTER_START_MINUTE = 0;
 unsigned long jetMaxRunTime = 30*60*1000UL;    // max time jets run for
-unsigned long jetLongRunTime = 12*60*60*1000UL; // run time for the 12 hour both-pumps button
+// Fix-A-Leak program: both pumps HIGH then LOW, repeating for the full duration
+const unsigned long FIX_A_LEAK_HIGH_TIME = 15*60*1000UL;    // 15 min on HIGH
+const unsigned long FIX_A_LEAK_LOW_TIME = 105*60*1000UL;    // 1 hr 45 min on LOW
+const unsigned long FIX_A_LEAK_DURATION = 12*60*60*1000UL;  // 12 hours total
 unsigned long lightMaxRunTime = 60*60*1000UL;  // max time light runs for
 
 //global control variable declarations
@@ -110,6 +116,8 @@ unsigned long jet2StartTime = 0;
 unsigned long jet2RunTime = 0;
 unsigned long lightStartTime = 0;
 bool filterCycleRunning = false;
+bool fixALeakActive = false;
+unsigned long fixALeakStartTime = 0;
 bool waterSensorOk = true;
 bool highLimitSensorOk = true;
 int waterSensorBadReads = 0;
@@ -135,7 +143,6 @@ void connectToMqtt();
 void connectToWiFi();
 void WiFiEvent(WiFiEvent_t event);
 void checkWiFi();
-bool longRunActive();
 void updateOzone();
 
 void checkHighLimitSensor();
@@ -150,7 +157,11 @@ void forceHeaterOff();
 void enterErrorState(int code, const String &info);
 bool intervalElapsed(unsigned long &lastRun, unsigned long interval);
 bool validSensorTemp(float tempF);
-void publishLongRunState();
+void publishFixALeakState();
+void startFixALeak();
+void stopFixALeak();
+void cancelFixALeak();
+void checkFixALeak();
 void publishDiscovery();
 void stabilizeSensors();
 void setSpaLight(int brightness);

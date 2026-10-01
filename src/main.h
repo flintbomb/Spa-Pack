@@ -75,6 +75,8 @@ const char* downButtonTopic = "spa/down_button";
 const char* jet1buttonTopic = "spa/jet1_button"; 
 const char* jet2buttonTopic = "spa/jet2_button";
 const char* jetsLongRunButtonTopic = "spa/jets_12h_button";  // payload LOW/HIGH/OFF runs both pumps for jetLongRunTime
+const char* jetsLongRunStateTopic = "spa/jets_12h_state";
+const char* jetsLongRunDiscoveryTopic = "homeassistant/select/spa_pack/jets_12h/config";  // Home Assistant MQTT discovery
 const char* lightButtonTopic = "spa/light_button";  
 const char* heaterStateTopic = "spa/heater_state";
 const char* jet1StateTopic = "spa/jet1_state";
@@ -143,6 +145,8 @@ void forceHeaterOff();
 void enterErrorState(int code, const String &info);
 bool intervalElapsed(unsigned long &lastRun, unsigned long interval);
 bool validSensorTemp(float tempF);
+void publishLongRunState();
+void publishDiscovery();
 void stabilizeSensors();
 void setSpaLight(int brightness);
 void checkJetTimers();

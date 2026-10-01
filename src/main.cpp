@@ -393,6 +393,10 @@ void onMqttConnect(bool sessionPresent) {
   outputPrint("Subscribing at QoS 1, packetId: ");
   outputPrintln(String(packetIdSub));
 
+  // Announce the 12 hour run control to Home Assistant
+  publishDiscovery();
+  publishLongRunState();
+
   // Publish initial setpoint temperature
   publishSetpointTemperature();
   publishCurrentTemperature();
@@ -830,6 +834,7 @@ void setJet1State(unsigned long runTime) {
   outputPrint(F("Publishing pump 1 state to MQTT..."));
   outputPrint(output);
   mqttClient.publish(jet1StateTopic, 1, true, output);
+  publishLongRunState();
 }
 
 void setJet2State(unsigned long runTime) {
@@ -861,6 +866,38 @@ void setJet2State(unsigned long runTime) {
   outputPrint(F("Publishing pump 2 state to MQTT..."));
   outputPrint(output);
   mqttClient.publish(jet2StateTopic, 1, true, output);
+  publishLongRunState();
+}
+
+// 12 hour run is active when both pumps are on at the same speed with the long run time
+void publishLongRunState() {
+  const char* state = "OFF";
+  if (jet1State > 0 && jet1State == jet2State &&
+      jet1RunTime == jetLongRunTime && jet2RunTime == jetLongRunTime) {
+    state = (jet1State == 2) ? "HIGH" : "LOW";
+  }
+  mqttClient.publish(jetsLongRunStateTopic, 1, true, state);
+}
+
+// Home Assistant MQTT discovery for the 12 hour run select
+void publishDiscovery() {
+  JsonDocument doc;
+  doc["name"] = "Jets 12 Hour Run";
+  doc["unique_id"] = "spa_pack_jets_12h";
+  doc["icon"] = "mdi:pump";
+  doc["command_topic"] = jetsLongRunButtonTopic;
+  doc["state_topic"] = jetsLongRunStateTopic;
+  JsonArray options = doc["options"].to<JsonArray>();
+  options.add("OFF");
+  options.add("LOW");
+  options.add("HIGH");
+  JsonObject device = doc["device"].to<JsonObject>();
+  device["identifiers"][0] = "spa_pack";
+  device["name"] = "Spa Pack";
+  String output;
+  serializeJson(doc, output);
+  outputPrintln(F("Publishing Home Assistant discovery..."));
+  mqttClient.publish(jetsLongRunDiscoveryTopic, 1, true, output.c_str());
 }
 
 // Set spa light brightness (0-255)

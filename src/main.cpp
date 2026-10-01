@@ -239,8 +239,9 @@ void loop() {
 
   //HOT TUB LOGIC **************************************************************************
   
-  // send Error state 
-  publishErrorState();
+  // send Error state every 30 seconds
+  static unsigned long lastErrorPublish = 0;
+  if (intervalElapsed(lastErrorPublish, 30000)) publishErrorState();
 
   // Check high limit sensor
   checkHighLimitSensor();
@@ -257,33 +258,28 @@ void loop() {
     // update NTP time and cHeck if filter cycle is due to begin
     checkFilterCycle();
 
+    bool flow = flowDetected();
     //only run heater if no jet pumps are on and flow is detected
-    if (flowDetected() && jet1State == OFF && jet2State == OFF) {
+    if (flow && jet1State == OFF && jet2State == OFF) {
+      noFlowSince = 0;
       // check temperature and turn heater on or off as needed
       checkTemperature();
-    } else if (jet1State == ON || jet2State == ON) {
-      if (heaterState != 2) {
+    } else if (jet1State > OFF || jet2State > OFF) {  // LOW or HIGH
+      if (heaterState != JETS_RUNNING) {
         heaterState = JETS_RUNNING;
-        digitalWrite(HEATER_PIN, OFF);  
+        digitalWrite(HEATER_PIN, OFF);
         publishHeaterState();
         outputPrintln(F("Heater turned off due to pump operation."));
       }
-    } else if (!flowDetected()) {
-      ERROR_STATE = 1;
-      publishErrorState();
-      if (heaterState != OFF) {
-        heaterState = OFF;
-        digitalWrite(HEATER_PIN, OFF); 
-        digitalWrite(CIRCULATION_PUMP_PIN, OFF); 
-        outputPrintln(F("No flow detected, heater turned off.")); //display every 10 seconds
-        publishHeaterState();
-      }
-      if (jet1State > 0 || jet2State > 0) {
-        jet1State = 0;
-        jet2State = 0;
-        setJet1State();
-        setJet2State();
-        outputPrintln(F("ERROR: Jets Turned Off!"));
+    } else {  // no flow with jets off
+      // heater off immediately, latch error only if no flow persists
+      forceHeaterOff();
+      if (noFlowSince == 0) {
+        noFlowSince = millis();
+        outputPrintln(F("No flow detected, heater turned off."));
+      } else if (millis() - noFlowSince >= NO_FLOW_ERROR_DELAY) {
+        digitalWrite(CIRCULATION_PUMP_PIN, OFF);
+        enterErrorState(1, "No flow detected from circulation pump");
       }
     }
 
@@ -381,6 +377,10 @@ void onMqttConnect(bool sessionPresent) {
   outputPrint("Subscribing at QoS 1, packetId: ");
   outputPrintln(String(packetIdSub));
 
+  packetIdSub = mqttClient.subscribe(jetsLongRunButtonTopic, 1);
+  outputPrint("Subscribing at QoS 1, packetId: ");
+  outputPrintln(String(packetIdSub));
+
   packetIdSub = mqttClient.subscribe(upButtonTopic, 1);
   outputPrint("Subscribing at QoS 1, packetId: ");
   outputPrintln(String(packetIdSub));
@@ -467,6 +467,20 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
     } else if (strncmp(payload, "HIGH",4) ==0) {
       jet2State = 2;
       setJet2State();
+    }
+  } else if (String(topic) == jetsLongRunButtonTopic) {
+    // Run both pumps together for jetLongRunTime (12 hours)
+    int newState = -1;
+    if (strncmp(payload, "OFF",3) == 0) newState = 0;
+    else if (strncmp(payload, "LOW",3) == 0) newState = 1;
+    else if (strncmp(payload, "HIGH",4) == 0) newState = 2;
+    if (newState >= 0) {
+      outputPrintln(F("Both pumps long run command received."));
+      filterCycleRunning = false;   // don't let an active filter cycle stop pump 1 early
+      jet1State = newState;
+      jet2State = newState;
+      setJet1State(jetLongRunTime);
+      setJet2State(jetLongRunTime);
     }
   } else if (String(topic) == upButtonTopic) {
     // Increase temperature setpoint
@@ -563,16 +577,44 @@ bool flowDetected() {
   }
 }
 
-void checkTemperature() {
-  static unsigned long lastCheck = 0;
+// Returns true (and resets the timer) once every interval ms; rollover safe
+bool intervalElapsed(unsigned long &lastRun, unsigned long interval) {
   unsigned long now = millis();
-  if (now - lastCheck < 3000) return;
-  lastCheck = now;
-  //Serial.print(TEMP_SETPOINT - TEMP_HYSTERESIS);
-  //Serial.print(" < ");
-  //Serial.print(currentTemp);
-  //Serial.print(" < ");
-  //Serial.println(heaterState);
+  if (now - lastRun < interval) return false;
+  lastRun = now;
+  return true;
+}
+
+// DS18B20 returns -196.6F when disconnected and 185F (85C) on a power-on reset
+bool validSensorTemp(float tempF) {
+  return tempF > SENSOR_MIN_VALID_F && tempF < SENSOR_MAX_VALID_F;
+}
+
+void forceHeaterOff() {
+  digitalWrite(HEATER_PIN, OFF);
+  if (heaterState != OFF) {
+    heaterState = OFF;
+    outputPrintln(F("Heater OFF"));
+    publishHeaterState();
+  }
+}
+
+void enterErrorState(int code, const String &info) {
+  forceHeaterOff();
+  ERROR_STATE = code;
+  ERROR_INFO = info;
+  outputPrintln("ERROR " + String(code) + ": " + info);
+  publishErrorState();
+}
+
+void checkTemperature() {
+  static unsigned long lastRun = 0;
+  if (!intervalElapsed(lastRun, 3000)) return; // Check every 3 seconds
+  // never heat on a stale or bad reading
+  if (!waterSensorOk || !highLimitSensorOk) {
+    forceHeaterOff();
+    return;
+  }
   if (heaterState != ON && currentTemp < (TEMP_SETPOINT - TEMP_HYSTERESIS)) {
     digitalWrite(HEATER_PIN, ON);
     heaterState = ON;
@@ -589,14 +631,26 @@ void checkTemperature() {
 void checkHighLimitSensor() {
   boolean triggerHighLimit = false;
   
-  if (ERROR_STATE > 0) return;
-  static unsigned long lastCheck = 0;
-  unsigned long now = millis();
-  if (now - lastCheck < 10000) return;
-  lastCheck = now;
+  static unsigned long lastRun = 0;
+
+  if (ERROR_STATE > 0) return; // If already in error state, skip checking
+  if (!intervalElapsed(lastRun, 10000)) return; // Check every 10 seconds
 
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
-  highLimitTemp = highLimitSensor.getTempFByIndex(0);
+  float reading = highLimitSensor.getTempFByIndex(0);
+  if (!validSensorTemp(reading)) {
+    highLimitSensorOk = false;
+    forceHeaterOff();
+    highLimitSensorBadReads++;
+    outputPrintln("High limit sensor bad reading: " + String(reading));
+    if (highLimitSensorBadReads >= SENSOR_MAX_BAD_READS) {
+      enterErrorState(4, "High limit sensor fault: " + String(reading, 1));
+    }
+    return;  // keep bad readings out of the smoothing array
+  }
+  highLimitSensorOk = true;
+  highLimitSensorBadReads = 0;
+  highLimitTemp = reading;
 
   // Shift previous temperatures
   for (int i = 4; i >= 0; i--) {
@@ -614,40 +668,45 @@ void checkHighLimitSensor() {
   }
 
   if (triggerHighLimit) {
-    digitalWrite(HEATER_PIN, OFF);
-    heaterState = OFF;
-    ERROR_STATE = 3;
-    ERROR_INFO = String(highLimitTemp, 1);
-    outputPrintln(F("ERROR: High limit temperature exceeded! Heater turned off."));
-    publishHeaterState();
+    enterErrorState(3, "High limit temperature exceeded: " + String(highLimitTemp, 1));
   }
 }
 
 void checkWaterTemperature() {
-  static unsigned long lastCheck = 0;
-  unsigned long now = millis();
-  if (now - lastCheck < 15000) return;
-  lastCheck = now;
+  static unsigned long lastRun = 0;
+  if (!intervalElapsed(lastRun, 15000)) return; // Check every 15 seconds
   waterSensor.requestTemperatures(); // Send the command to get temperatures
-  currentTemp = waterSensor.getTempFByIndex(0);
-  //outputPrint(F("Current water temperature: "));
-  //outputPrintln(String(currentTemp));
+  float reading = waterSensor.getTempFByIndex(0);
+  if (!validSensorTemp(reading)) {
+    // keep last good currentTemp, but don't heat on it
+    waterSensorOk = false;
+    forceHeaterOff();
+    waterSensorBadReads++;
+    outputPrintln("Water sensor bad reading: " + String(reading));
+    if (ERROR_STATE == 0 && waterSensorBadReads >= SENSOR_MAX_BAD_READS) {
+      enterErrorState(4, "Water sensor fault: " + String(reading, 1));
+    }
+    return;
+  }
+  waterSensorOk = true;
+  waterSensorBadReads = 0;
+  currentTemp = reading;
   publishCurrentTemperature();
 }
 
 void checkJetTimers() {
   unsigned long currentTime = millis();
-  if (jet1Timer < currentTime && jet1State > 0) {
+  if (jet1State > 0 && currentTime - jet1StartTime >= jet1RunTime) {
     outputPrintln(F("Jet 1 timer expired, turning off Jet 1."));
     jet1State = 0;
     setJet1State();
   }
-  if (jet2Timer < currentTime && jet2State > 0) {
+  if (jet2State > 0 && currentTime - jet2StartTime >= jet2RunTime) {
     outputPrintln(F("Jet 2 timer expired, turning off Jet 2."));
     jet2State = 0;
     setJet2State();
   }
-  if (lightTimer < currentTime && lightState > 0) {
+  if (lightState > 0 && currentTime - lightStartTime >= lightMaxRunTime) {
     outputPrintln(F("Light timer expired, turning off lights."));
     lightState = 0;
     setSpaLight(OFF);
@@ -674,7 +733,9 @@ void checkFilterCycle() {
   int currentHour = timeClient.getHours();
   int currentMinute = timeClient.getMinutes();
 
-  if (!filterCycleRunning && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE) {
+  // Check for alarm condition
+  // skip if pump 1 is already running so a 12 hour run isn't cut down to the filter time
+  if (!filterCycleRunning && jet1State == OFF && currentHour == FILTER_START_HOUR && currentMinute == FILTER_START_MINUTE) {
     filterCycleRunning = true;
     filterStartTime = millis();
     jet1State = 1;
@@ -730,10 +791,6 @@ void publishHeaterState() {
 }
 
 void publishErrorState() {
-  static unsigned long lastCheck = 0;
-  unsigned long now = millis();
-  if (now - lastCheck < 30000) return;
-  lastCheck = now;
   char output[12];
   snprintf(output, sizeof(output), "%d", ERROR_STATE);
   outputPrint(F("Publishing error state to MQTT..."));
@@ -743,21 +800,20 @@ void publishErrorState() {
   mqttClient.publish(errorStateTopic, 1, true, output);
 }
 
-void setJet1State() {
+void setJet1State(unsigned long runTime) {
+  jet1StartTime = millis();   //restart jet off timer
+  jet1RunTime = runTime;
   if (jet1State == 1) {
-    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP1_HIGH_PIN, OFF);
     delay(250);
     digitalWrite(PUMP1_LOW_PIN, ON);
-    outputPrintln(F("Pump 1 set to LOW"));
+    outputPrintln("Pump 1 set to LOW for " + String(runTime / 60000) + " min");
   } else if (jet1State == 2) {
-    jet1Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP1_LOW_PIN, OFF);
     delay(250);
     digitalWrite(PUMP1_HIGH_PIN, ON);
-    outputPrintln(F("Pump 1 set to HIGH"));
+    outputPrintln("Pump 1 set to HIGH for " + String(runTime / 60000) + " min");
   } else if (jet1State == 0) {
-    jet1Timer = millis();
     digitalWrite(PUMP1_HIGH_PIN, OFF);
     digitalWrite(PUMP1_LOW_PIN, OFF);
     outputPrintln(F("Pump 1 turned OFF"));
@@ -776,21 +832,20 @@ void setJet1State() {
   mqttClient.publish(jet1StateTopic, 1, true, output);
 }
 
-void setJet2State() {
+void setJet2State(unsigned long runTime) {
+  jet2StartTime = millis();   //restart jet off timer
+  jet2RunTime = runTime;
   if (jet2State == 1) {
-    jet2Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_LOW_PIN, ON);
-    outputPrintln(F("Pump 2 set to LOW"));
+    outputPrintln("Pump 2 set to LOW for " + String(runTime / 60000) + " min");
   } else if (jet2State == 2) {
-    jet2Timer = millis() + jetMaxRunTime;   //set jet off timer ahead by max run time
     digitalWrite(PUMP2_LOW_PIN, OFF);
     delay(500);
     digitalWrite(PUMP2_HIGH_PIN, ON);
-    outputPrintln(F("Pump 2 set to HIGH"));
+    outputPrintln("Pump 2 set to HIGH for " + String(runTime / 60000) + " min");
   } else if (jet2State == 0) {
-    jet2Timer = millis();
     digitalWrite(PUMP2_HIGH_PIN, OFF);
     digitalWrite(PUMP2_LOW_PIN, OFF);
     outputPrintln(F("Pump 2 turned OFF"));
@@ -818,16 +873,15 @@ void setSpaLight(int brightness) {
   JsonDocument doc;
   if (lightState == 1) {
     doc["state"] = "LOW";
-    lightTimer = millis() + lightMaxRunTime;   //set light low timer ahead by max run time
+    lightStartTime = millis();   //restart light off timer
   } else if (lightState == 2) {
     doc["state"] = "MEDIUM"; 
-    lightTimer = millis() + lightMaxRunTime;   //set light MEDIUM timer ahead by max run time
+    lightStartTime = millis();   //restart light off timer
   } else if (lightState == 3) {
     doc["state"] = "HIGH";
-    lightTimer = millis() + lightMaxRunTime;   //set light HIGH timer ahead by max run time
+    lightStartTime = millis();   //restart light off timer
   } else if (lightState == OFF) {
     doc["state"] = "OFF";
-    lightTimer = millis();
   }
 
   char output[256];

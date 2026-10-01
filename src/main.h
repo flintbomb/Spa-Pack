@@ -38,6 +38,13 @@ int ERROR_STATE = 0;
 // 1 ERROR: No flow detected from circulation pump!
 // 2 ERROR: Flow before circulation pump turned on!
 // 3 ERROR: High limit temperature exceeded! Heater turned off!
+// 4 ERROR: Temperature sensor fault (disconnected or out of range)! Heater turned off!
+
+// Valid sensor reading range in Fahrenheit; anything outside is treated as a bad reading
+const float SENSOR_MIN_VALID_F = 32.0;
+const float SENSOR_MAX_VALID_F = 140.0;
+const int SENSOR_MAX_BAD_READS = 3;   // consecutive bad reads before latching error 4
+const unsigned long NO_FLOW_ERROR_DELAY = 5000;  // no flow must persist this long (ms) before latching error 1
 
 int TEMP_SETPOINT = 71; // Desired temperature in Fahrenheit
 const float TEMP_HYSTERESIS = 0.5; // Hysteresis in Fahrenheit
@@ -67,6 +74,7 @@ const char* upButtonTopic = "spa/up_button";
 const char* downButtonTopic = "spa/down_button";
 const char* jet1buttonTopic = "spa/jet1_button"; 
 const char* jet2buttonTopic = "spa/jet2_button";
+const char* jetsLongRunButtonTopic = "spa/jets_12h_button";  // payload LOW/HIGH/OFF runs both pumps for jetLongRunTime
 const char* lightButtonTopic = "spa/light_button";  
 const char* heaterStateTopic = "spa/heater_state";
 const char* jet1StateTopic = "spa/jet1_state";
@@ -79,8 +87,9 @@ const char* errorStateTopic = "spa/status";
 int FILTER_DURATION = 30; // in minutes
 int FILTER_START_HOUR = 8; // 8 AM
 int FILTER_START_MINUTE = 0;
-unsigned long jetMaxRunTime = 30*60*1000;    // max time jets run for 
-unsigned long lightMaxRunTime = 60*60*1000;  // max time light runs for
+unsigned long jetMaxRunTime = 30*60*1000UL;    // max time jets run for
+unsigned long jetLongRunTime = 12*60*60*1000UL; // run time for the 12 hour both-pumps button
+unsigned long lightMaxRunTime = 60*60*1000UL;  // max time light runs for
 
 //global control variable declarations
 int jet1State = 0;
@@ -90,10 +99,18 @@ int heaterState = 0;
 float currentTemp = 0.0;
 float highLimitTemp = 0.0;
 unsigned long wifiConnectTimer = 0;
-unsigned long jet1Timer = 0;
-unsigned long jet2Timer = 0;
-unsigned long lightTimer = 0;
+// run timers store start time + duration so they survive millis() rollover
+unsigned long jet1StartTime = 0;
+unsigned long jet1RunTime = 0;
+unsigned long jet2StartTime = 0;
+unsigned long jet2RunTime = 0;
+unsigned long lightStartTime = 0;
 bool filterCycleRunning = false;
+bool waterSensorOk = true;
+bool highLimitSensorOk = true;
+int waterSensorBadReads = 0;
+int highLimitSensorBadReads = 0;
+unsigned long noFlowSince = 0;   // 0 = flow currently detected
 
 
 void outputPrintln(const String &msg);
@@ -120,8 +137,12 @@ void publishCurrentTemperature();
 void publishSetpointTemperature();
 void publishErrorState();  
 void publishHeaterState();
-void setJet1State();
-void setJet2State();
+void setJet1State(unsigned long runTime = jetMaxRunTime);
+void setJet2State(unsigned long runTime = jetMaxRunTime);
+void forceHeaterOff();
+void enterErrorState(int code, const String &info);
+bool intervalElapsed(unsigned long &lastRun, unsigned long interval);
+bool validSensorTemp(float tempF);
 void stabilizeSensors();
 void setSpaLight(int brightness);
 void checkJetTimers();

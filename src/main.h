@@ -43,23 +43,24 @@ int ERROR_STATE = 0;
 // Valid sensor reading range in Fahrenheit; anything outside is treated as a bad reading
 const float SENSOR_MIN_VALID_F = 32.0;
 const float SENSOR_MAX_VALID_F = 140.0;
-const int SENSOR_MAX_BAD_READS = 3;   // consecutive bad reads before latching error 4
+const int SENSOR_MAX_BAD_READS = 3;
+const int SENSOR_STABILIZE_ATTEMPTS = 30;  // ~30s at boot before giving up with error 4   // consecutive bad reads before latching error 4
 const unsigned long NO_FLOW_ERROR_DELAY = 5000;  // no flow must persist this long (ms) before latching error 1
 
 int TEMP_SETPOINT = 71; // Desired temperature in Fahrenheit
 const float TEMP_HYSTERESIS = 0.5; // Hysteresis in Fahrenheit
-const long CHECK_WIFI_INTERVAL = 30000; // Check every 30 seconds
 
 const char* WIFI_SSID = "DropItLikeItsAHotspot";
 const char* WIFI_PASSWORD = "flintbomb";
-const int wifiConnectTimeOut = 10*1000; // 5 seconds between connect attemps
+const char* WIFI_HOSTNAME = "spa-pack";
+const unsigned long WIFI_RETRY_INTERVAL = 30*1000UL;     // force a fresh connect attempt this often while down
+const unsigned long WIFI_REBOOT_TIMEOUT = 15*60*1000UL;  // restart if WiFi down this long (only when jets/light are off)
 const int HTTP_PORT = 80;
 IPAddress local_IP(10, 69, 69, 111);       // Set your desired static IP
 IPAddress gateway(10, 69, 69, 1);         // Set your router's IP address
 IPAddress subnet(255, 255, 255, 0);        // Set your subnet mask
 IPAddress primaryDNS(8, 8, 8, 8);          // Optional: Set a primary DNS server
 IPAddress secondaryDNS(8, 8, 4, 4);        // Optional: Set a secondary DNS server
-const unsigned long interval = 30000; // Interval to check WiFi connection in milliseconds
 
 
 #define MQTT_HOST IPAddress(10, 69, 69, 100)
@@ -100,7 +101,8 @@ int lightState = 0;
 int heaterState = 0;
 float currentTemp = 0.0;
 float highLimitTemp = 0.0;
-unsigned long wifiConnectTimer = 0;
+unsigned long wifiLastAttempt = 0;
+unsigned long wifiDownSince = 0;
 // run timers store start time + duration so they survive millis() rollover
 unsigned long jet1StartTime = 0;
 unsigned long jet1RunTime = 0;
@@ -132,6 +134,9 @@ void onMqttConnect(bool sessionPresent);
 void connectToMqtt();
 void connectToWiFi();
 void WiFiEvent(WiFiEvent_t event);
+void checkWiFi();
+bool longRunActive();
+void updateOzone();
 
 void checkHighLimitSensor();
 void checkWaterTemperature();

@@ -37,11 +37,6 @@ Preferences preferences;
 // mqtt declarations
 AsyncMqttClient mqttClient;
 TimerHandle_t mqttReconnectTimer;
-TimerHandle_t wifiReconnectTimer;
-TimerHandle_t getTimeTimer;
-
-//wifi connection variables
-unsigned long previousMillis = 0;
 AsyncWebServer server(80);
 
 // NTP Client setup for time keeping
@@ -117,8 +112,6 @@ void setup() {
 
   //create timers for tasks
   mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
-  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWiFi));
-  getTimeTimer = xTimerCreate("timeTimer", pdMS_TO_TICKS(60000), pdTRUE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(getNTPTime));
 
   //Setup MQTT Server and Callbacks
   mqttClient.onConnect(onMqttConnect);
@@ -131,8 +124,12 @@ void setup() {
   mqttClient.setCredentials(MQTT_USER, MQTT_PASSWORD);
 
   //connect to WiFi 
+  WiFi.persistent(false);     // don't rewrite flash on every connect
+  WiFi.setHostname(WIFI_HOSTNAME);   // must be set before WiFi.mode()
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);       // no modem power save: faster response and reliable OTA
+  WiFi.setAutoReconnect(true);
   WiFi.onEvent(WiFiEvent);
-  wifiConnectTimer = millis() - wifiConnectTimeOut;  // reset connection timeout
   connectToWiFi();
 
   //setup Webserial
@@ -224,16 +221,15 @@ void setup() {
   //Stabilize temperature sensors
   stabilizeSensors();
 
-  //Turn on OZONE 
-  if (ERROR_STATE == 0) digitalWrite(OZONE_PIN, ON);
-
 }
 
 void loop() {
   
-  if (WiFi.status() != WL_CONNECTED && millis() > (wifiConnectTimer + wifiConnectTimeOut)) {
-      connectToWiFi();
-  }
+  checkWiFi();
+
+  // update NTP time every 60 seconds (from loop, not a timer/event task)
+  static unsigned long lastNtpUpdate = 0;
+  if (WiFi.isConnected() && intervalElapsed(lastNtpUpdate, 60000)) getNTPTime();
   //Handle Arduino OTA
   ArduinoOTA.handle();
 
@@ -284,6 +280,8 @@ void loop() {
     }
 
   }
+  updateOzone();
+
   // END HOT TUB LOGIC ********************************************************************8
 
 }
@@ -308,26 +306,43 @@ void outputPrint(const String &msg) {
   WebSerial.print(msgOut);
 }
 
+// Start a fresh connection attempt with the static IP
 void connectToWiFi() {
-    // Red led while connecting to WiFi
-  WiFi.disconnect();
+  // Red led while connecting to WiFi
   leds[0] = CRGB::Red;
   FastLED.show();
-  WiFi.mode(WIFI_STA);
-    if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-      outputPrintln("STA Failed to configure");
-    }
+  WiFi.disconnect();
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    outputPrintln("STA Failed to configure");
+  }
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  wifiConnectTimer = millis();  //reset connection attempt timer
-  outputPrint(F("Connecting to WiFi .."));
+  wifiLastAttempt = millis();
+  outputPrintln(F("Connecting to WiFi..."));
+}
 
+// The only place reconnects are started. The driver's auto reconnect gets
+// WIFI_RETRY_INTERVAL to recover before we force a fresh attempt, so attempts
+// never cut each other off. Reboots if WiFi stays down too long and the
+// jets/light aren't running.
+void checkWiFi() {
+  static unsigned long lastCheck = 0;
+  if (!intervalElapsed(lastCheck, 1000)) return;
 
+  if (WiFi.isConnected()) {
+    wifiDownSince = 0;
+    return;
+  }
+  unsigned long now = millis();
+  if (wifiDownSince == 0) wifiDownSince = now;
 
-
-//   while (WiFi.status() != WL_CONNECTED) {
-//     Serial.print(F("."));
-//     delay(1000);
-//   }
+  if (now - wifiLastAttempt >= WIFI_RETRY_INTERVAL) {
+    outputPrintln(F("WiFi still down, retrying."));
+    connectToWiFi();
+  }
+  if (now - wifiDownSince >= WIFI_REBOOT_TIMEOUT && jet1State == OFF && jet2State == OFF && lightState == OFF) {
+    outputPrintln(F("WiFi down too long, restarting."));
+    ESP.restart();
+  }
 }
 
 void connectToMqtt() {
@@ -336,29 +351,21 @@ void connectToMqtt() {
 }
 
 void WiFiEvent(WiFiEvent_t event) {
-    String output = "[WiFi-event] event: " + String(event);
-    outputPrintln(output);
-    IPAddress ip = WiFi.localIP();
     switch(event) {
     case SYSTEM_EVENT_STA_GOT_IP:     // means we have connected to wifi
         // Blue led while connected to WiFi
         leds[0] = CRGB::Blue;
         FastLED.show();
-        outputPrintln("WiFi connected");
-        outputPrintln("IP address: ");
-        outputPrintln(ip.toString());
-        getNTPTime();   //update time
-        xTimerStart(getTimeTimer, 0);
+        outputPrintln("WiFi connected, IP address: " + WiFi.localIP().toString());
         connectToMqtt();
         break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
-        // Red led while connecting to WiFi
+        // Red led while connecting to WiFi; checkWiFi() handles retries
         leds[0] = CRGB::Red;
         FastLED.show();
-        outputPrintln("WiFi lost connection");
-        wifiConnectTimer = millis() + 2000; //reset connection timer timeout with additinal 2 sec delay  
         xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
-        xTimerStart(wifiReconnectTimer, 0);
+        break;
+    default:
         break;
     }
 }
@@ -536,8 +543,14 @@ void onMqttPublish(uint16_t packetId) {
 
 void stabilizeSensors() {
   bool stabil = false;
+  int attempts = 0;
   outputPrint(F("Wating for sensors to stabilize..."));
   while (!stabil) {
+  if (++attempts > SENSOR_STABILIZE_ATTEMPTS) {
+    // give up so loop() (and OTA) still runs; heater stays off
+    enterErrorState(4, F("Temperature sensor not responding at boot"));
+    return;
+  }
   outputPrint(F("."));
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
   float highLimitTemp = highLimitSensor.getTempFByIndex(0);
@@ -870,10 +883,25 @@ void setJet2State(unsigned long runTime) {
 }
 
 // 12 hour run is active when both pumps are on at the same speed with the long run time
+bool longRunActive() {
+  return jet1State > 0 && jet1State == jet2State &&
+         jet1RunTime == jetLongRunTime && jet2RunTime == jetLongRunTime;
+}
+
+// Ozone runs only with no errors and no 12 hour run
+void updateOzone() {
+  static int ozoneState = -1;
+  int wanted = (ERROR_STATE == 0 && !longRunActive()) ? ON : OFF;
+  if (wanted != ozoneState) {
+    ozoneState = wanted;
+    digitalWrite(OZONE_PIN, wanted);
+    outputPrintln(wanted == ON ? F("Ozone ON") : F("Ozone OFF"));
+  }
+}
+
 void publishLongRunState() {
   const char* state = "OFF";
-  if (jet1State > 0 && jet1State == jet2State &&
-      jet1RunTime == jetLongRunTime && jet2RunTime == jetLongRunTime) {
+  if (longRunActive()) {
     state = (jet1State == 2) ? "HIGH" : "LOW";
   }
   mqttClient.publish(jetsLongRunStateTopic, 1, true, state);

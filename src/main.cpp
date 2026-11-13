@@ -409,9 +409,19 @@ void connectToWiFi(bool resetRadio) {
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     outputPrintln("STA Failed to configure");
   }
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSIDS[wifiNetIndex], WIFI_PASSWORD);
   wifiLastAttempt = millis();
-  outputPrintln(F("Connecting to WiFi..."));
+  wifiNetAttempts++;
+  outputPrintln("Connecting to WiFi " + String(WIFI_SSIDS[wifiNetIndex]) + "...");
+}
+
+// Move to the next network in WIFI_SSIDS and start connecting with a fresh radio
+void switchWiFiNetwork(const String &why) {
+  wifiNetIndex = (wifiNetIndex + 1) % WIFI_NETWORK_COUNT;
+  wifiNetAttempts = 0;
+  wifiGotIpTime = 0;
+  outputPrintln(why + ", switching to " + String(WIFI_SSIDS[wifiNetIndex]));
+  connectToWiFi(true);
 }
 
 // The only place reconnects are started. The driver's auto reconnect gets
@@ -436,8 +446,10 @@ void checkWiFi() {
   }
   if (wifiGotIpEvent) {
     wifiGotIpEvent = false;
-    outputPrintln("WiFi connected after " + String(millis() / 1000) + "s uptime, attempt " + String(wifiAttempts) +
-                  ", IP " + WiFi.localIP().toString() + ", signal " + String(WiFi.RSSI()) + " dBm");
+    outputPrintln("WiFi connected to " + String(WIFI_SSIDS[wifiNetIndex]) + " after " + String(millis() / 1000) +
+                  "s uptime, attempt " + String(wifiAttempts) + ", IP " + WiFi.localIP().toString() +
+                  ", signal " + String(WiFi.RSSI()) + " dBm");
+    wifiGotIpTime = millis();
     if (!wifiConnectedOnce) {
       wifiConnectedOnce = true;
       saveWifiHistory("connected");
@@ -447,8 +459,15 @@ void checkWiFi() {
 
   if (WiFi.isConnected()) {
     wifiDownSince = 0;
+    if (mqttClient.connected()) {
+      wifiNetAttempts = 0;   // this network works end to end
+    } else if (wifiGotIpTime != 0 && millis() - wifiGotIpTime >= MQTT_NETWORK_TIMEOUT) {
+      // joined WiFi but can't reach the broker (e.g. isolated IoT network)
+      switchWiFiNetwork("On WiFi but MQTT unreachable");
+    }
     return;
   }
+  wifiGotIpTime = 0;
   unsigned long now = millis();
   if (wifiDownSince == 0) {
     wifiDownSince = now;
@@ -457,8 +476,12 @@ void checkWiFi() {
   }
 
   if (now - wifiLastAttempt >= WIFI_RETRY_INTERVAL) {
-    outputPrintln(F("WiFi still down, resetting radio and retrying."));
-    connectToWiFi(true);
+    if (wifiNetAttempts >= WIFI_ATTEMPTS_PER_NETWORK) {
+      switchWiFiNetwork("WiFi not connecting");
+    } else {
+      outputPrintln(F("WiFi still down, retrying."));
+      connectToWiFi(false);
+    }
   }
   if (now - wifiDownSince >= WIFI_REBOOT_TIMEOUT && jet1State == OFF && jet2State == OFF && lightState == OFF) {
     safeRestart("WiFi down too long");
@@ -533,6 +556,7 @@ void publishDiagnostics() {
   doc["uptime_min"] = millis() / 60000;
   doc["reset_reason"] = resetReasonString();
   doc["rssi"] = WiFi.RSSI();
+  doc["ssid"] = WIFI_SSIDS[wifiNetIndex];
   doc["wifi_drops"] = wifiDisconnectCount;
   doc["wifi_last_reason"] = wifiLastDisconnectReason;
   doc["mqtt_drops"] = mqttDisconnectCount;
@@ -566,7 +590,7 @@ void safeRestart(const String &why) {
 
 // WiFi state, attempts and recent disconnect reasons for this boot, saved to flash
 void saveWifiHistory(const char* state) {
-  String rec = String(state) + " at " + String(millis() / 1000) + "s, attempts " + String(wifiAttempts) +
+  String rec = String(state) + " on " + WIFI_SSIDS[wifiNetIndex] + " at " + String(millis() / 1000) + "s, attempts " + String(wifiAttempts) +
                ", reset " + resetReasonString();
   uint32_t count = wifiDisconnectCount;
   if (count) {

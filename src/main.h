@@ -1,5 +1,6 @@
 #include <AsyncMqttClient.h>
 #include <WiFi.h>
+#include "secrets.h"   // credentials, git-ignored (copy secrets.example.h)
 
 #define ON 1
 #define OFF 0
@@ -51,8 +52,13 @@ const unsigned long BOOT_FLOW_SETTLE_TIME = 15000;  // after a reboot, wait this
 int TEMP_SETPOINT = 71; // Desired temperature in Fahrenheit
 const float TEMP_HYSTERESIS = 0.5; // Hysteresis in Fahrenheit
 
-const char* WIFI_SSID = "DropItLikeItsAHotspot";
-const char* WIFI_PASSWORD = "flintbomb";
+// Networks tried in order. The IoT network is WPA2-only 2.4GHz (most reliable for the
+// ESP32); the main network is the fallback if the IoT one can't connect or can't reach MQTT.
+const char* WIFI_SSIDS[] = { SECRET_WIFI_SSID_1, SECRET_WIFI_SSID_2 };
+const int WIFI_NETWORK_COUNT = 2;
+const char* WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
+const int WIFI_ATTEMPTS_PER_NETWORK = 2;          // forced retries before switching network
+const unsigned long MQTT_NETWORK_TIMEOUT = 90*1000UL;  // on WiFi but no MQTT this long: switch network
 const char* WIFI_HOSTNAME = "spa-pack";
 const unsigned long WIFI_RETRY_INTERVAL = 30*1000UL;     // force a fresh connect attempt this often while down
 const unsigned long WIFI_FIRST_RETRY_DELAY = 10*1000UL;  // after a drop, let the driver try on its own this long first
@@ -69,8 +75,8 @@ IPAddress secondaryDNS(8, 8, 4, 4);        // Optional: Set a secondary DNS serv
 
 #define MQTT_HOST IPAddress(10, 69, 69, 100)
 #define MQTT_PORT 1883
-const char* MQTT_USER = "mqtt_login";
-const char* MQTT_PASSWORD = "flint";
+const char* MQTT_USER = SECRET_MQTT_USER;
+const char* MQTT_PASSWORD = SECRET_MQTT_PASSWORD;
 
 //mqtt topics
 const char* waterTempTopic = "spa/water_temp";
@@ -125,6 +131,9 @@ volatile uint32_t wifiDisconnectCount = 0;
 const uint32_t WIFI_REASON_LOG_SIZE = 10;
 volatile uint8_t wifiReasonLog[WIFI_REASON_LOG_SIZE] = {0};
 uint32_t wifiAttempts = 0;
+int wifiNetIndex = 0;             // index into WIFI_SSIDS
+int wifiNetAttempts = 0;          // attempts on the current network since it last worked
+unsigned long wifiGotIpTime = 0;  // when the current WiFi connection got its IP (0 = not connected)
 bool wifiConnectedOnce = false;
 String prevBootWifi = "";      // WiFi record saved by the previous boot
 String prevRestartWhy = "";    // why the previous boot restarted
@@ -161,6 +170,7 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
 void onMqttConnect(bool sessionPresent);
 void connectToMqtt();
 void connectToWiFi(bool resetRadio = false);
+void switchWiFiNetwork(const String &why);
 void safeRestart(const String &why);
 void saveWifiHistory(const char* state);
 void loadPreviousBootInfo();

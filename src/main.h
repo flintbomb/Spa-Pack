@@ -122,6 +122,12 @@ volatile bool wifiGotIpEvent = false;
 volatile bool wifiDisconnectEvent = false;
 volatile uint8_t wifiLastDisconnectReason = 0;
 volatile uint32_t wifiDisconnectCount = 0;
+const uint32_t WIFI_REASON_LOG_SIZE = 10;
+volatile uint8_t wifiReasonLog[WIFI_REASON_LOG_SIZE] = {0};
+uint32_t wifiAttempts = 0;
+bool wifiConnectedOnce = false;
+String prevBootWifi = "";      // WiFi record saved by the previous boot
+String prevRestartWhy = "";    // why the previous boot restarted
 uint32_t mqttDisconnectCount = 0;
 // run timers store start time + duration so they survive millis() rollover
 unsigned long jet1StartTime = 0;
@@ -154,7 +160,11 @@ void onMqttSubscribe(uint16_t packetId, uint8_t qos);
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
 void onMqttConnect(bool sessionPresent);
 void connectToMqtt();
-void connectToWiFi();
+void connectToWiFi(bool resetRadio = false);
+void safeRestart(const String &why);
+void saveWifiHistory(const char* state);
+void loadPreviousBootInfo();
+const char* wifiReasonName(uint8_t reason);
 void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 void checkWiFi();
 void checkMqtt();

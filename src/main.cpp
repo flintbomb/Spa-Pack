@@ -93,14 +93,8 @@ void setup() {
   FILTER_START_HOUR = preferences.getInt("filterHour", FILTER_START_HOUR);
   FILTER_START_MINUTE = preferences.getInt("filterMinute", FILTER_START_MINUTE);
   FILTER_DURATION = preferences.getInt("filterDuration", FILTER_DURATION);
-  outputPrint(F("Stored Setpoint: "));
-  outputPrintln(String(TEMP_SETPOINT));
-  outputPrint(F("Stored Filter Time: "));
-  outputPrint(String(FILTER_START_HOUR));
-  outputPrint(F(":"));
-  outputPrintln(String(FILTER_START_MINUTE));
-  outputPrint(F("Stored Filter Duration: "));
-  outputPrint(String(FILTER_DURATION));
+  outputPrintln("Stored setpoint " + String(TEMP_SETPOINT) + "F, filter " + String(FILTER_START_HOUR) + ":" +
+                (FILTER_START_MINUTE < 10 ? "0" : "") + String(FILTER_START_MINUTE) + " for " + String(FILTER_DURATION) + " min");
   preferences.end();
 
   //Set initial LED state: red until WiFi connects
@@ -109,6 +103,7 @@ void setup() {
   leds[0] = CRGB::Red;
   FastLED.show();
   outputPrintln(String("Reset reason: ") + resetReasonString());
+  loadPreviousBootInfo();
 
   // Start up the DallasTemperature library
   highLimitSensor.begin();
@@ -163,8 +158,7 @@ void setup() {
       outputPrintln("Start updating " + type);
     })
     .onEnd([]() {
-      outputPrintln("\nEnd");
-      ESP.restart();
+      safeRestart("OTA update installed");
     })
     .onProgress([](unsigned int progress, unsigned int total) {
       //outputPrintln("Progress: %u%%\r", (progress / (total / 100)));
@@ -351,10 +345,7 @@ void flushLogs() {
 void handleCommand(const String &d) {
   outputPrintln("Command: " + d);
   if (d.startsWith("r")) {
-    outputPrintln("Restarting...");
-    flushLogs();
-    delay(200);
-    ESP.restart();
+    safeRestart("restart command");
   } else if (d.startsWith("h") || d.startsWith("m")) {
     String numberString = "";
     for (int i = 0; i < d.length(); i++) {
@@ -401,9 +392,20 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventTyp
   }
 }
 
-// Start a fresh connection attempt with the static IP
-void connectToWiFi() {
-  WiFi.disconnect();
+// Start a fresh connection attempt with the static IP.
+// resetRadio fully restarts the WiFi radio first, clearing any stuck driver state.
+void connectToWiFi(bool resetRadio) {
+  wifiAttempts++;
+  if (resetRadio) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.setHostname(WIFI_HOSTNAME);
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+  } else {
+    WiFi.disconnect();
+  }
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     outputPrintln("STA Failed to configure");
   }
@@ -421,13 +423,25 @@ void checkWiFi() {
   if (!intervalElapsed(lastCheck, 1000)) return;
 
   // log WiFi events here rather than in the WiFi event task
+  static unsigned long lastHistorySave = 0;
   if (wifiDisconnectEvent) {
     wifiDisconnectEvent = false;
-    outputPrintln("WiFi lost connection, reason " + String(wifiLastDisconnectReason));
+    outputPrintln("WiFi disconnected: " + String(wifiReasonName(wifiLastDisconnectReason)) +
+                  " (" + String(wifiLastDisconnectReason) + ")");
+    // keep a record in flash in case this boot never reconnects (at most every 30s)
+    if (millis() - lastHistorySave >= 30000) {
+      lastHistorySave = millis();
+      saveWifiHistory("not connected");
+    }
   }
   if (wifiGotIpEvent) {
     wifiGotIpEvent = false;
-    outputPrintln("WiFi connected, IP " + WiFi.localIP().toString() + ", signal " + String(WiFi.RSSI()) + " dBm");
+    outputPrintln("WiFi connected after " + String(millis() / 1000) + "s uptime, attempt " + String(wifiAttempts) +
+                  ", IP " + WiFi.localIP().toString() + ", signal " + String(WiFi.RSSI()) + " dBm");
+    if (!wifiConnectedOnce) {
+      wifiConnectedOnce = true;
+      saveWifiHistory("connected");
+    }
     mqttLastAttempt = millis() - MQTT_RETRY_INTERVAL;   // connect MQTT right away
   }
 
@@ -443,12 +457,11 @@ void checkWiFi() {
   }
 
   if (now - wifiLastAttempt >= WIFI_RETRY_INTERVAL) {
-    outputPrintln(F("WiFi still down, retrying."));
-    connectToWiFi();
+    outputPrintln(F("WiFi still down, resetting radio and retrying."));
+    connectToWiFi(true);
   }
   if (now - wifiDownSince >= WIFI_REBOOT_TIMEOUT && jet1State == OFF && jet2State == OFF && lightState == OFF) {
-    outputPrintln(F("WiFi down too long, restarting."));
-    ESP.restart();
+    safeRestart("WiFi down too long");
   }
 }
 
@@ -526,9 +539,76 @@ void publishDiagnostics() {
   doc["free_heap"] = ESP.getFreeHeap();
   doc["min_free_heap"] = ESP.getMinFreeHeap();
   doc["error"] = ERROR_STATE;
-  char output[256];
+  doc["prev_restart"] = prevRestartWhy;
+  doc["prev_boot_wifi"] = prevBootWifi;
+  String output;
   serializeJson(doc, output);
-  mqttClient.publish(diagnosticsTopic, 1, true, output);
+  mqttClient.publish(diagnosticsTopic, 1, true, output.c_str());
+}
+
+// Restart after logging why, saying goodbye to MQTT and the WiFi router first
+// so the router doesn't hold on to the old connection and refuse the rejoin.
+void safeRestart(const String &why) {
+  outputPrintln("Restarting: " + why);
+  Preferences diag;   // own instance: the shared one is also used from the MQTT task
+  diag.begin("diag", false);
+  diag.putString("restartWhy", why);
+  diag.end();
+  saveWifiHistory("restarting");
+  flushLogs();
+  delay(200);
+  mqttClient.disconnect();
+  delay(200);
+  WiFi.disconnect(true);   // sends a proper disconnect to the router
+  delay(500);
+  ESP.restart();
+}
+
+// WiFi state, attempts and recent disconnect reasons for this boot, saved to flash
+void saveWifiHistory(const char* state) {
+  String rec = String(state) + " at " + String(millis() / 1000) + "s, attempts " + String(wifiAttempts) +
+               ", reset " + resetReasonString();
+  uint32_t count = wifiDisconnectCount;
+  if (count) {
+    rec += ", reasons";
+    uint32_t first = count > WIFI_REASON_LOG_SIZE ? count - WIFI_REASON_LOG_SIZE : 0;
+    for (uint32_t i = first; i < count; i++) rec += " " + String(wifiReasonLog[i % WIFI_REASON_LOG_SIZE]);
+  }
+  Preferences diag;   // own instance: the shared one is also used from the MQTT task
+  diag.begin("diag", false);
+  diag.putString("wifi", rec);
+  diag.end();
+}
+
+// Read what the previous boot recorded, log it, and clear the restart note
+void loadPreviousBootInfo() {
+  Preferences diag;   // own instance: the shared one is also used from the MQTT task
+  diag.begin("diag", false);
+  prevBootWifi = diag.getString("wifi", "none");
+  prevRestartWhy = diag.getString("restartWhy", "");
+  diag.remove("restartWhy");
+  diag.end();
+  if (prevRestartWhy.length() == 0) prevRestartWhy = resetReasonString();   // not a planned restart
+  outputPrintln("Previous restart: " + prevRestartWhy);
+  outputPrintln("Previous boot WiFi: " + prevBootWifi);
+}
+
+const char* wifiReasonName(uint8_t reason) {
+  switch (reason) {
+    case 2:   return "auth expired";
+    case 3:   return "router kicked us (auth leave)";
+    case 4:   return "assoc expired";
+    case 5:   return "router full";
+    case 8:   return "assoc leave";
+    case 15:  return "4-way handshake timeout";
+    case 200: return "beacon timeout (signal lost)";
+    case 201: return "no AP found";
+    case 202: return "auth failed (password?)";
+    case 203: return "assoc failed";
+    case 204: return "handshake timeout";
+    case 205: return "connection failed";
+    default:  return "other";
+  }
 }
 
 // Runs in the WiFi event task: only set flags here, loop() does the work
@@ -539,6 +619,7 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
+        wifiReasonLog[wifiDisconnectCount % WIFI_REASON_LOG_SIZE] = wifiLastDisconnectReason;
         wifiDisconnectCount++;
         wifiDisconnectEvent = true;
         break;
@@ -548,34 +629,16 @@ void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 void onMqttConnect(bool sessionPresent) {
-  outputPrintln("Connected to MQTT.");
-  outputPrint("Session present: ");
-  outputPrintln(String(sessionPresent));
-  
+  outputPrintln(F("Connected to MQTT."));
+
   // Subscribe to topics
-  uint16_t packetIdSub = mqttClient.subscribe(jet1buttonTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
-
-  packetIdSub = mqttClient.subscribe(jet2buttonTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
-
-  packetIdSub = mqttClient.subscribe(fixALeakSetTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
-
-  packetIdSub = mqttClient.subscribe(upButtonTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
-
-  packetIdSub = mqttClient.subscribe(downButtonTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
-
-    packetIdSub = mqttClient.subscribe(lightButtonTopic, 1);
-  outputPrint("Subscribing at QoS 1, packetId: ");
-  outputPrintln(String(packetIdSub));
+  mqttClient.subscribe(jet1buttonTopic, 1);
+  mqttClient.subscribe(jet2buttonTopic, 1);
+  mqttClient.subscribe(fixALeakSetTopic, 1);
+  mqttClient.subscribe(upButtonTopic, 1);
+  mqttClient.subscribe(downButtonTopic, 1);
+  mqttClient.subscribe(lightButtonTopic, 1);
+  outputPrintln(F("Subscribed to control topics."));
 
   // Announce the 12 hour run control to Home Assistant
   publishDiscovery();
@@ -593,9 +656,7 @@ void onMqttConnect(bool sessionPresent) {
 }
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
-  outputPrintln("Disconnected from MQTT.");
-  outputPrint("Reason: ");
-  outputPrintln(String(static_cast<uint8_t>(reason)));
+  outputPrintln("Disconnected from MQTT, reason " + String(static_cast<uint8_t>(reason)));
   mqttDisconnectCount++;   // checkMqtt() in loop() reconnects
 }
 
@@ -607,13 +668,13 @@ void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
 }
 
 void onMqttUnsubscribe(uint16_t packetId) {
-  outputPrintln("Unsubscribe acknowledged.");
-  outputPrint("  packetId: ");
-  outputPrintln(String(packetId));
+
 }
 
 void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
-  outputPrintln("Publish received.");
+  String payloadText;
+  for (size_t i = 0; i < len && i < 64; i++) payloadText += payload[i];
+  outputPrintln("Received " + String(topic) + ": " + payloadText);
   // outputPrint("  topic: ");
   // outputPrintln(topic);
   // outputPrint("  qos: ");
@@ -714,14 +775,13 @@ void onMqttPublish(uint16_t packetId) {
 void stabilizeSensors() {
   bool stabil = false;
   int attempts = 0;
-  outputPrint(F("Wating for sensors to stabilize..."));
+  outputPrintln(F("Waiting for temperature sensors..."));
   while (!stabil) {
   if (++attempts > SENSOR_STABILIZE_ATTEMPTS) {
     // give up so loop() (and OTA) still runs; heater stays off
     enterErrorState(4, F("Temperature sensor not responding at boot"));
     return;
   }
-  outputPrint(F("."));
   highLimitSensor.requestTemperatures(); // Send the command to get temperatures
   float highLimitTemp = highLimitSensor.getTempFByIndex(0);
   waterSensor.requestTemperatures(); // Send the command to get temperatures
@@ -911,14 +971,13 @@ void getNTPTime() {
   int currentHour = timeClient.getHours();
   int currentMinute = timeClient.getMinutes();
 
-    outputPrint(F("Time updated to    -"));
-    outputPrint(String(currentHour));
-    outputPrint(F(":"));
-    outputPrintln(String(currentMinute));
-    outputPrint(F("Filter Cycle Start -"));
-    outputPrint(String(FILTER_START_HOUR));
-    outputPrint(F(":"));
-    outputPrintln(String(FILTER_START_MINUTE));
+  // log the clock once an hour (and the first time) rather than every minute
+  static int lastLoggedHour = -1;
+  if (currentHour != lastLoggedHour) {
+    lastLoggedHour = currentHour;
+    outputPrintln("Clock " + timeClient.getFormattedTime() + ", filter cycle starts " + String(FILTER_START_HOUR) + ":" +
+                  (FILTER_START_MINUTE < 10 ? "0" : "") + String(FILTER_START_MINUTE));
+  }
 }
 void checkFilterCycle() {
   static unsigned long filterStartTime = 0;
@@ -946,8 +1005,7 @@ void publishSetpointTemperature() {
   doc["temperature"] = String(TEMP_SETPOINT).c_str();
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing setpoint temperature to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing setpoint " + String(output));
   mqttClient.publish(setpointTempTopic, 1, true, output);
 }
 
@@ -957,8 +1015,7 @@ void publishCurrentTemperature() {
   doc["temperature"] = String(currentTemp).c_str();
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing current temperature to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing water temp " + String(output) + ", high limit " + String(highLimitTemp, 1));
   
   // convert high limit temp to char array
   snprintf(charArray, sizeof(charArray), "%.1f", highLimitTemp);
@@ -977,18 +1034,21 @@ void publishHeaterState() {
   }
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing heater state to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing heater " + String(output));
   mqttClient.publish(heaterStateTopic, 1, true, output);
 }
 
 void publishErrorState() {
   char output[12];
   snprintf(output, sizeof(output), "%d", ERROR_STATE);
-  outputPrint(F("Publishing error state to MQTT..."));
-  outputPrintln(output);
-  outputPrintln(F("Error info: "));
-  outputPrintln(ERROR_INFO);
+  // only log the periodic status when there is an error or it changed
+  static int lastLoggedState = -1;
+  if (ERROR_STATE != 0 || ERROR_STATE != lastLoggedState) {
+    String line = "Publishing status " + String(output);
+    if (ERROR_INFO.length()) line += " (" + ERROR_INFO + ")";
+    outputPrintln(line);
+    lastLoggedState = ERROR_STATE;
+  }
   mqttClient.publish(errorStateTopic, 1, true, output);
 }
 
@@ -1019,8 +1079,7 @@ void setJet1State(unsigned long runTime) {
    else doc["state"] = "OFF";
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing pump 1 state to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing pump 1 " + String(output));
   mqttClient.publish(jet1StateTopic, 1, true, output);
   publishFixALeakState();
 }
@@ -1051,8 +1110,7 @@ void setJet2State(unsigned long runTime) {
    else doc["state"] = "OFF";
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing pump 2 state to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing pump 2 " + String(output));
   mqttClient.publish(jet2StateTopic, 1, true, output);
   publishFixALeakState();
 }
@@ -1169,8 +1227,7 @@ void publishSensorDiscovery(const char* id, const char* name, const char* stateT
 // Set spa light brightness (0-255)
 void setSpaLight(int brightness) {
   ledcWrite(channel, brightness);
-  outputPrint(F("Setting spa light brightness to: "));
-  outputPrint(String(brightness));
+  outputPrintln("Spa light brightness " + String(brightness));
    
   //publish to mqtt
   JsonDocument doc;
@@ -1189,7 +1246,6 @@ void setSpaLight(int brightness) {
 
   char output[256];
   serializeJson(doc, output);
-  outputPrint(F("Publishing light state to MQTT..."));
-  outputPrint(output);
+  outputPrintln("Publishing light " + String(output));
   mqttClient.publish(lightStateTopic, 1, true, output);
 }

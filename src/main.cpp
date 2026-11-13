@@ -10,15 +10,12 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <arduinoJson.h>
-#include <WebSerial.h>
+#include <deque>
+#include <vector>
+#include "log_page.h"
 #include <FastLED.h>
 #include <NTPClient.h>
-#include <WiFiUdp.h>
-
-extern "C" {
-	#include "freertos/FreeRTOS.h"
-	#include "freertos/timers.h"
-}
+#include <esp_task_wdt.h>
 
 //TODO
 //Pump logic on button press
@@ -36,8 +33,16 @@ Preferences preferences;
 
 // mqtt declarations
 AsyncMqttClient mqttClient;
-TimerHandle_t mqttReconnectTimer;
 AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
+
+// live log buffer (shared between tasks, guarded by logMutex)
+SemaphoreHandle_t logMutex = NULL;
+std::deque<String> logHistory;
+uint32_t logSeq = 0;
+String logPartial = "";
+String pendingCommand = "";
 
 // NTP Client setup for time keeping
 WiFiUDP ntpUDP;
@@ -56,6 +61,7 @@ CRGB leds[NUM_LEDS]; // Creates an array to hold the LED data
 
 void setup() {
   Serial.begin(115200);
+  logMutex = xSemaphoreCreateMutex();
 
   pinMode(HEATER_PIN, OUTPUT);
   digitalWrite(HEATER_PIN, OFF);
@@ -97,11 +103,12 @@ void setup() {
   outputPrint(String(FILTER_DURATION));
   preferences.end();
 
-  //Set initial LED state
+  //Set initial LED state: red until WiFi connects
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(BRIGHTNESS);
-  FastLED.clear();
+  leds[0] = CRGB::Red;
   FastLED.show();
+  outputPrintln(String("Reset reason: ") + resetReasonString());
 
   // Start up the DallasTemperature library
   highLimitSensor.begin();
@@ -109,9 +116,6 @@ void setup() {
 
   //Activate and check circulation pump, if bad flow sensor or no flow detected sets error state TRUE
   checkCirculationPump(); //Check if circulation pump is running
-
-  //create timers for tasks
-  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
 
   //Setup MQTT Server and Callbacks
   mqttClient.onConnect(onMqttConnect);
@@ -129,52 +133,19 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);       // no modem power save: faster response and reliable OTA
   WiFi.setAutoReconnect(true);
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);     // scan every channel and
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // join the strongest access point, not the first one found
   WiFi.onEvent(WiFiEvent);
   connectToWiFi();
 
-  //setup Webserial
-  WebSerial.begin(&server);
-    /* Attach Message Callback */
-  WebSerial.onMessage([&](uint8_t *data, size_t len) {
-    Serial.write(data, len);
-    WebSerial.println("Received Data...");
-    String d = "";
-    for(size_t i=0; i < len; i++){
-      d += char(data[i]);
-    }
-    WebSerial.println(d);
-    if (d.startsWith("r")) {
-      outputPrintln("Restarting...");
-      ESP.restart();
-    } else if (d.startsWith("h")) {
-      String numberString = "";
-      for (int i = 0; i < d.length(); i++) {
-        if (isDigit(d.charAt(i))) {
-          numberString += d.charAt(i);
-        }
-      }
-      FILTER_START_HOUR = numberString.toInt(); // Use toInt() for numbers
-      //Store hour in NVM
-      preferences.begin("states", false);
-      preferences.putInt("filterHour", FILTER_START_HOUR); 
-      preferences.end(); 
-      outputPrint(F("Set filter start hour to :"));
-      outputPrintln(String(FILTER_START_HOUR));
-    } else if (d.startsWith("m")) {
-      String numberString = "";
-      for (int i = 0; i < d.length(); i++) {
-        if (isDigit(d.charAt(i))) {
-          numberString += d.charAt(i);
-        }
-      }
-      FILTER_START_MINUTE = numberString.toInt(); // Use toInt() for numbers
-      //Store minute in NVM
-      preferences.begin("states", false);
-      preferences.putInt("filterMinute", FILTER_START_MINUTE); 
-      preferences.end(); 
-      outputPrint(F("Set filter start minute to :"));
-      outputPrintln(String(FILTER_START_MINUTE));
-    }
+  //setup live log page and websocket
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", LOG_PAGE_HTML);
+  });
+  server.on("/webserial", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->redirect("/");   // old WebSerial bookmark
   });
   server.begin();
 
@@ -221,11 +192,29 @@ void setup() {
   //Stabilize temperature sensors
   stabilizeSensors();
 
+  // restart automatically if loop() ever hangs
+  esp_task_wdt_init(LOOP_WATCHDOG_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
 }
 
 void loop() {
-  
+  esp_task_wdt_reset();
+
   checkWiFi();
+  checkMqtt();
+  updateStatusLed();
+  flushLogs();
+
+  // run commands from the live log page here, not in the network task
+  String cmd;
+  xSemaphoreTake(logMutex, portMAX_DELAY);
+  cmd = pendingCommand;
+  pendingCommand = "";
+  xSemaphoreGive(logMutex);
+  if (cmd.length()) handleCommand(cmd);
+
+  static unsigned long lastDiagnostics = 0;
+  if (intervalElapsed(lastDiagnostics, 60000)) publishDiagnostics();
 
   // update NTP time every 60 seconds (from loop, not a timer/event task)
   static unsigned long lastNtpUpdate = 0;
@@ -289,31 +278,131 @@ void loop() {
 
 }
 
+// ---------------- Logging ----------------
+// outputPrint/outputPrintln can be called from any task. Complete lines go into
+// a mutex-protected buffer; loop() sends new lines to the live log page and to
+// Home Assistant (MQTT), so the network libraries are only touched from loop().
+void addLogLine(const String &msg) {
+  String line = logTimestamp() + " ";
+  if (ERROR_STATE > 0) line += "Error State: ";
+  line += msg;
+  Serial.println(line);
+  if (logMutex == NULL) return;
+  xSemaphoreTake(logMutex, portMAX_DELAY);
+  logHistory.push_back(line);
+  logSeq++;
+  while (logHistory.size() > LOG_HISTORY_LINES) logHistory.pop_front();
+  xSemaphoreGive(logMutex);
+}
+
 void outputPrintln(const String &msg) {
-  String msgOut = msg;
-  if (ERROR_STATE > 0) {
-    msgOut = "Error State: ";
-    msgOut = msgOut + msg;
-  }
-  Serial.println(msgOut);
-  WebSerial.println(msgOut);
+  String line;
+  if (logMutex != NULL) xSemaphoreTake(logMutex, portMAX_DELAY);
+  line = logPartial + msg;
+  logPartial = "";
+  if (logMutex != NULL) xSemaphoreGive(logMutex);
+  addLogLine(line);
 }
 
 void outputPrint(const String &msg) {
-  String msgOut = msg;
-  if (ERROR_STATE > 0) {
-    msgOut = "Error State: ";
-    msgOut = msgOut + msg;
+  if (logMutex != NULL) xSemaphoreTake(logMutex, portMAX_DELAY);
+  logPartial += msg;
+  if (logPartial.length() > 200) logPartial = logPartial.substring(0, 200);
+  if (logMutex != NULL) xSemaphoreGive(logMutex);
+}
+
+// "HH:MM:SS" once NTP has synced, otherwise uptime "+Ns"
+String logTimestamp() {
+  if (timeClient.isTimeSet()) return timeClient.getFormattedTime();
+  return "+" + String(millis() / 1000) + "s";
+}
+
+// Called from loop(): push lines added since the last call to websocket clients and MQTT
+void flushLogs() {
+  static uint32_t sentSeq = 0;
+  ws.cleanupClients();
+  if (logMutex == NULL) return;
+
+  std::vector<String> fresh;
+  xSemaphoreTake(logMutex, portMAX_DELAY);
+  uint32_t newCount = logSeq - sentSeq;
+  if (newCount > logHistory.size()) newCount = logHistory.size();
+  for (size_t i = logHistory.size() - newCount; i < logHistory.size(); i++) fresh.push_back(logHistory[i]);
+  sentSeq = logSeq;
+  xSemaphoreGive(logMutex);
+  if (fresh.empty()) return;
+
+  if (ws.count() > 0) {
+    String batch;
+    for (auto &l : fresh) { batch += l; batch += '\n'; }
+    ws.textAll(batch);
   }
-  Serial.print(msgOut);
-  WebSerial.print(msgOut);
+  if (mqttClient.connected()) {
+    for (auto &l : fresh) {
+      // routine publish chatter stays on the live page only
+      if (l.indexOf("Publishing") >= 0) continue;
+      String msg = l.length() > 250 ? l.substring(0, 250) : l;
+      mqttClient.publish(logTopic, 0, false, msg.c_str());
+    }
+  }
+}
+
+// Commands typed on the live log page
+void handleCommand(const String &d) {
+  outputPrintln("Command: " + d);
+  if (d.startsWith("r")) {
+    outputPrintln("Restarting...");
+    flushLogs();
+    delay(200);
+    ESP.restart();
+  } else if (d.startsWith("h") || d.startsWith("m")) {
+    String numberString = "";
+    for (int i = 0; i < d.length(); i++) {
+      if (isDigit(d.charAt(i))) numberString += d.charAt(i);
+    }
+    if (numberString.length() == 0) return;
+    int value = numberString.toInt();
+    preferences.begin("states", false);
+    if (d.startsWith("h") && value < 24) {
+      FILTER_START_HOUR = value;
+      preferences.putInt("filterHour", FILTER_START_HOUR);
+      outputPrintln("Set filter start hour to: " + String(FILTER_START_HOUR));
+    } else if (d.startsWith("m") && value < 60) {
+      FILTER_START_MINUTE = value;
+      preferences.putInt("filterMinute", FILTER_START_MINUTE);
+      outputPrintln("Set filter start minute to: " + String(FILTER_START_MINUTE));
+    } else {
+      outputPrintln(F("Value out of range."));
+    }
+    preferences.end();
+  } else {
+    outputPrintln(F("Unknown command. Use r, h<hour>, m<minute>."));
+  }
+}
+
+// Runs in the network task: send history to new clients, hand commands to loop()
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    String batch;
+    xSemaphoreTake(logMutex, portMAX_DELAY);
+    for (auto &l : logHistory) { batch += l; batch += '\n'; }
+    xSemaphoreGive(logMutex);
+    client->text(batch);
+  } else if (type == WS_EVT_DATA) {
+    AwsFrameInfo *info = (AwsFrameInfo *)arg;
+    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
+      String cmd;
+      for (size_t i = 0; i < len && i < 64; i++) cmd += (char)data[i];
+      cmd.trim();
+      xSemaphoreTake(logMutex, portMAX_DELAY);
+      pendingCommand = cmd;
+      xSemaphoreGive(logMutex);
+    }
+  }
 }
 
 // Start a fresh connection attempt with the static IP
 void connectToWiFi() {
-  // Red led while connecting to WiFi
-  leds[0] = CRGB::Red;
-  FastLED.show();
   WiFi.disconnect();
   if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
     outputPrintln("STA Failed to configure");
@@ -331,12 +420,27 @@ void checkWiFi() {
   static unsigned long lastCheck = 0;
   if (!intervalElapsed(lastCheck, 1000)) return;
 
+  // log WiFi events here rather than in the WiFi event task
+  if (wifiDisconnectEvent) {
+    wifiDisconnectEvent = false;
+    outputPrintln("WiFi lost connection, reason " + String(wifiLastDisconnectReason));
+  }
+  if (wifiGotIpEvent) {
+    wifiGotIpEvent = false;
+    outputPrintln("WiFi connected, IP " + WiFi.localIP().toString() + ", signal " + String(WiFi.RSSI()) + " dBm");
+    mqttLastAttempt = millis() - MQTT_RETRY_INTERVAL;   // connect MQTT right away
+  }
+
   if (WiFi.isConnected()) {
     wifiDownSince = 0;
     return;
   }
   unsigned long now = millis();
-  if (wifiDownSince == 0) wifiDownSince = now;
+  if (wifiDownSince == 0) {
+    wifiDownSince = now;
+    // give the driver's own reconnect a short head start before forcing a fresh attempt
+    wifiLastAttempt = now - WIFI_RETRY_INTERVAL + WIFI_FIRST_RETRY_DELAY;
+  }
 
   if (now - wifiLastAttempt >= WIFI_RETRY_INTERVAL) {
     outputPrintln(F("WiFi still down, retrying."));
@@ -353,20 +457,90 @@ void connectToMqtt() {
   mqttClient.connect();
 }
 
-void WiFiEvent(WiFiEvent_t event) {
+// MQTT reconnects are driven from loop() only (no timer task)
+void checkMqtt() {
+  if (!WiFi.isConnected() || mqttClient.connected()) return;
+  if (millis() - mqttLastAttempt < MQTT_RETRY_INTERVAL) return;
+  mqttLastAttempt = millis();
+  connectToMqtt();
+}
+
+// Status LED: blue = WiFi connected, red = not connected.
+// With an error it flashes that colour: 3 quick flashes, pause, then one slow
+// flash per error number (e.g. error 2 = 2 slow flashes), long pause, repeat.
+void updateStatusLed() {
+  static CRGB shown = CRGB(1, 2, 3);   // forces the first write
+  CRGB color = WiFi.isConnected() ? CRGB::Blue : CRGB::Red;
+  bool on = true;
+
+  if (ERROR_STATE > 0) {
+    const unsigned long QUICK = 150, SLOW = 600, GAP = 1000, END_PAUSE = 2500;
+    unsigned long quickPart = 3 * 2 * QUICK;
+    unsigned long slowPart = (unsigned long)ERROR_STATE * 2 * SLOW;
+    unsigned long cycle = quickPart + GAP + slowPart + END_PAUSE;
+    unsigned long t = millis() % cycle;
+    if (t < quickPart) {
+      on = (t / QUICK) % 2 == 0;
+    } else if (t < quickPart + GAP) {
+      on = false;
+    } else if (t < quickPart + GAP + slowPart) {
+      on = ((t - quickPart - GAP) / SLOW) % 2 == 0;
+    } else {
+      on = false;
+    }
+  }
+
+  CRGB wanted = on ? color : CRGB(CRGB::Black);
+  if (wanted != shown) {
+    shown = wanted;
+    leds[0] = wanted;
+    FastLED.show();
+  }
+}
+
+const char* resetReasonString() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power on";
+    case ESP_RST_SW:        return "software restart";
+    case ESP_RST_PANIC:     return "crash";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "loop watchdog (hang)";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_BROWNOUT:  return "brownout (low power)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_EXT:       return "external reset";
+    default:                return "unknown";
+  }
+}
+
+// Retained JSON on spa/diagnostics so the cause of a dropout is visible afterwards
+void publishDiagnostics() {
+  if (!mqttClient.connected()) return;
+  JsonDocument doc;
+  doc["uptime_min"] = millis() / 60000;
+  doc["reset_reason"] = resetReasonString();
+  doc["rssi"] = WiFi.RSSI();
+  doc["wifi_drops"] = wifiDisconnectCount;
+  doc["wifi_last_reason"] = wifiLastDisconnectReason;
+  doc["mqtt_drops"] = mqttDisconnectCount;
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["min_free_heap"] = ESP.getMinFreeHeap();
+  doc["error"] = ERROR_STATE;
+  char output[256];
+  serializeJson(doc, output);
+  mqttClient.publish(diagnosticsTopic, 1, true, output);
+}
+
+// Runs in the WiFi event task: only set flags here, loop() does the work
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch(event) {
-    case SYSTEM_EVENT_STA_GOT_IP:     // means we have connected to wifi
-        // Blue led while connected to WiFi
-        leds[0] = CRGB::Blue;
-        FastLED.show();
-        outputPrintln("WiFi connected, IP address: " + WiFi.localIP().toString());
-        connectToMqtt();
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        wifiGotIpEvent = true;
         break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-        // Red led while connecting to WiFi; checkWiFi() handles retries
-        leds[0] = CRGB::Red;
-        FastLED.show();
-        xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
+        wifiDisconnectCount++;
+        wifiDisconnectEvent = true;
         break;
     default:
         break;
@@ -412,6 +586,7 @@ void onMqttConnect(bool sessionPresent) {
   publishCurrentTemperature();
   publishHeaterState();
   publishErrorState();
+  publishDiagnostics();
   mqttClient.publish(lightStateTopic, 1, true, "OFF");
   mqttClient.publish(jet1StateTopic, 1, true, "OFF");
   mqttClient.publish(jet2StateTopic, 1, true, "OFF");
@@ -421,13 +596,10 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
   outputPrintln("Disconnected from MQTT.");
   outputPrint("Reason: ");
   outputPrintln(String(static_cast<uint8_t>(reason)));
-  if (WiFi.isConnected()) {
-    xTimerStart(mqttReconnectTimer, 0);
-  }
+  mqttDisconnectCount++;   // checkMqtt() in loop() reconnects
 }
 
 void onMqttSubscribe(uint16_t packetId, uint8_t qos) {
-  outputPrintln("Subscribe acknowledged.");
   // outputPrint("  packetId: ");
   // outputPrintln(packetId);
   // outputPrint("  qos: ");
@@ -535,7 +707,6 @@ void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties 
 }
 
 void onMqttPublish(uint16_t packetId) {
-  outputPrintln("Publish acknowledged.");
   // outputPrint("  packetId: ");
   // outputPrintln(packetId);
 }
@@ -568,6 +739,11 @@ void stabilizeSensors() {
 
 void checkCirculationPump() {
   // CHeck if circulation pump and flow sensor are working
+  // After a restart water can still be moving for a few seconds; wait for it to stop
+  unsigned long settleStart = millis();
+  while (flowDetected() && millis() - settleStart < BOOT_FLOW_SETTLE_TIME) {
+    delay(100);
+  }
   if (!flowDetected()) {
     digitalWrite(CIRCULATION_PUMP_PIN, ON);
     delay(5000); // wait 5 seconds to see if flow is detected
@@ -963,6 +1139,31 @@ void publishDiscovery() {
   serializeJson(doc, output);
   outputPrintln(F("Publishing Home Assistant discovery..."));
   mqttClient.publish(fixALeakDiscoveryTopic, 1, true, output.c_str());
+
+  publishSensorDiscovery("log", "Log", logTopic, "{{ value[:255] }}", "mdi:text-box-outline", NULL);
+  publishSensorDiscovery("wifi_signal", "WiFi Signal", diagnosticsTopic, "{{ value_json.rssi }}", "mdi:wifi", "dBm");
+  publishSensorDiscovery("uptime", "Uptime", diagnosticsTopic, "{{ value_json.uptime_min }}", "mdi:timer-outline", "min");
+  publishSensorDiscovery("reset_reason", "Last Reset Reason", diagnosticsTopic, "{{ value_json.reset_reason }}", "mdi:restart", NULL);
+  publishSensorDiscovery("wifi_drops", "WiFi Drops", diagnosticsTopic, "{{ value_json.wifi_drops }}", "mdi:wifi-off", NULL);
+}
+
+// One Home Assistant MQTT sensor on the Spa Pack device
+void publishSensorDiscovery(const char* id, const char* name, const char* stateTopic, const char* tmpl, const char* icon, const char* unit) {
+  JsonDocument doc;
+  doc["name"] = name;
+  doc["unique_id"] = String("spa_pack_") + id;
+  doc["state_topic"] = stateTopic;
+  doc["value_template"] = tmpl;
+  doc["icon"] = icon;
+  if (unit) doc["unit_of_measurement"] = unit;
+  if (strcmp(stateTopic, diagnosticsTopic) == 0) doc["entity_category"] = "diagnostic";
+  JsonObject device = doc["device"].to<JsonObject>();
+  device["identifiers"][0] = "spa_pack";
+  device["name"] = "Spa Pack";
+  String output;
+  serializeJson(doc, output);
+  String topic = String("homeassistant/sensor/spa_pack/") + id + "/config";
+  mqttClient.publish(topic.c_str(), 1, true, output.c_str());
 }
 
 // Set spa light brightness (0-255)

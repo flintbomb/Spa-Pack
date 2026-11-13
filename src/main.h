@@ -43,9 +43,10 @@ int ERROR_STATE = 0;
 // Valid sensor reading range in Fahrenheit; anything outside is treated as a bad reading
 const float SENSOR_MIN_VALID_F = 32.0;
 const float SENSOR_MAX_VALID_F = 140.0;
-const int SENSOR_MAX_BAD_READS = 3;
-const int SENSOR_STABILIZE_ATTEMPTS = 30;  // ~30s at boot before giving up with error 4   // consecutive bad reads before latching error 4
+const int SENSOR_MAX_BAD_READS = 3;   // consecutive bad reads before latching error 4
+const int SENSOR_STABILIZE_ATTEMPTS = 30;  // ~30s at boot before giving up with error 4
 const unsigned long NO_FLOW_ERROR_DELAY = 5000;  // no flow must persist this long (ms) before latching error 1
+const unsigned long BOOT_FLOW_SETTLE_TIME = 15000;  // after a reboot, wait this long for leftover flow to stop before error 2
 
 int TEMP_SETPOINT = 71; // Desired temperature in Fahrenheit
 const float TEMP_HYSTERESIS = 0.5; // Hysteresis in Fahrenheit
@@ -54,7 +55,10 @@ const char* WIFI_SSID = "DropItLikeItsAHotspot";
 const char* WIFI_PASSWORD = "flintbomb";
 const char* WIFI_HOSTNAME = "spa-pack";
 const unsigned long WIFI_RETRY_INTERVAL = 30*1000UL;     // force a fresh connect attempt this often while down
+const unsigned long WIFI_FIRST_RETRY_DELAY = 10*1000UL;  // after a drop, let the driver try on its own this long first
 const unsigned long WIFI_REBOOT_TIMEOUT = 15*60*1000UL;  // restart if WiFi down this long (only when jets/light are off)
+const unsigned long MQTT_RETRY_INTERVAL = 10*1000UL;     // MQTT reconnect attempt interval while WiFi is up
+const int LOOP_WATCHDOG_TIMEOUT_S = 60;                  // restart if loop() stops running this long
 const int HTTP_PORT = 80;
 IPAddress local_IP(10, 69, 69, 111);       // Set your desired static IP
 IPAddress gateway(10, 69, 69, 1);         // Set your router's IP address
@@ -88,6 +92,9 @@ const char* jet2StateTopic = "spa/jet2_state";
 const char* lightStateTopic = "spa/light_state";
 const char* highLimitTopic = "spa/high_limit";
 const char* errorStateTopic = "spa/status";
+const char* diagnosticsTopic = "spa/diagnostics";   // JSON: uptime, reset reason, WiFi signal, heap
+const char* logTopic = "spa/log";                   // every log line (except routine publish chatter)
+const size_t LOG_HISTORY_LINES = 150;               // lines shown when the live log page opens
 
 //Filtration cycle info
 int FILTER_DURATION = 30; // in minutes
@@ -109,6 +116,13 @@ float currentTemp = 0.0;
 float highLimitTemp = 0.0;
 unsigned long wifiLastAttempt = 0;
 unsigned long wifiDownSince = 0;
+unsigned long mqttLastAttempt = 0;
+// set from the WiFi event task, handled in loop()
+volatile bool wifiGotIpEvent = false;
+volatile bool wifiDisconnectEvent = false;
+volatile uint8_t wifiLastDisconnectReason = 0;
+volatile uint32_t wifiDisconnectCount = 0;
+uint32_t mqttDisconnectCount = 0;
 // run timers store start time + duration so they survive millis() rollover
 unsigned long jet1StartTime = 0;
 unsigned long jet1RunTime = 0;
@@ -141,8 +155,12 @@ void onMqttDisconnect(AsyncMqttClientDisconnectReason reason);
 void onMqttConnect(bool sessionPresent);
 void connectToMqtt();
 void connectToWiFi();
-void WiFiEvent(WiFiEvent_t event);
+void WiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 void checkWiFi();
+void checkMqtt();
+void updateStatusLed();
+void publishDiagnostics();
+const char* resetReasonString();
 void updateOzone();
 
 void checkHighLimitSensor();
@@ -163,6 +181,11 @@ void stopFixALeak();
 void cancelFixALeak();
 void checkFixALeak();
 void publishDiscovery();
+void publishSensorDiscovery(const char* id, const char* name, const char* stateTopic, const char* tmpl, const char* icon, const char* unit);
+void addLogLine(const String &msg);
+String logTimestamp();
+void flushLogs();
+void handleCommand(const String &d);
 void stabilizeSensors();
 void setSpaLight(int brightness);
 void checkJetTimers();
